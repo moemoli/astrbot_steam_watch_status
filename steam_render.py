@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import re
 import time
 import uuid
 from pathlib import Path
@@ -24,7 +25,7 @@ except Exception:  # pragma: no cover
 class SteamRenderer:
     def __init__(self, cards_dir: Path):
         self._cards_dir = cards_dir
-        self._steam_logo_cache: dict[int, Any] = {}
+        self._steam_logo_cache: dict[tuple[int, int], Any] = {}
         self._font_cache: dict[tuple[str, int], Any] = {}
 
     async def render_playing_card(
@@ -351,11 +352,17 @@ class SteamRenderer:
             if key in self._font_cache:
                 return self._font_cache[key]
             try:
-                font = ImageFont.truetype(p, size=size)
+                font = ImageFont.truetype(p, size=size, encoding="unic")
                 self._font_cache[key] = font
                 return font
             except Exception:
-                continue
+                try:
+                    data = Path(p).read_bytes()
+                    font = ImageFont.truetype(io.BytesIO(data), size=size, encoding="unic")
+                    self._font_cache[key] = font
+                    return font
+                except Exception:
+                    continue
         return ImageFont.load_default()
 
     @staticmethod
@@ -380,19 +387,22 @@ class SteamRenderer:
 
     def _draw_steam_badge(self, canvas, draw, x: int, y: int) -> None:
         draw.rounded_rectangle([(x, y), (x + 160, y + 48)], radius=10, fill=(34, 51, 74))
-        logo = self._load_steam_logo_icon(24)
+        logo = self._load_steam_logo_icon(134, 30)
         if logo is not None:
-            canvas.paste(logo, (x + 12, y + 12), logo)
+            lx = x + (160 - logo.width) // 2
+            ly = y + (48 - logo.height) // 2
+            canvas.paste(logo, (lx, ly), logo)
         else:
             draw.ellipse([(x + 12, y + 12), (x + 36, y + 36)], fill=(180, 205, 225))
             draw.text((x + 19, y + 13), "S", fill=(34, 51, 74), font=self._load_font(18))
-        draw.text((x + 44, y + 13), "STEAM", fill=(215, 230, 245), font=self._load_font(20))
+            draw.text((x + 44, y + 13), "STEAM", fill=(215, 230, 245), font=self._load_font(20))
 
-    def _load_steam_logo_icon(self, size: int):
+    def _load_steam_logo_icon(self, target_w: int, target_h: int):
         if Image is None:
             return None
-        if size in self._steam_logo_cache:
-            return self._steam_logo_cache[size]
+        cache_key = (target_w, target_h)
+        if cache_key in self._steam_logo_cache:
+            return self._steam_logo_cache[cache_key]
 
         logo_svg = self._cards_dir.parent / "assets" / "logo_steam.svg"
         if not logo_svg.exists() or cairosvg is None:
@@ -400,14 +410,39 @@ class SteamRenderer:
 
         try:
             svg_data = logo_svg.read_bytes()
+            ratio = 355.666 / 89.333
+            vb = self._parse_svg_viewbox(svg_data)
+            if vb is not None and vb[2] > 0 and vb[3] > 0:
+                ratio = vb[2] / vb[3]
+
+            output_w = max(1, int(target_w))
+            output_h = max(1, int(round(output_w / ratio)))
+            if output_h > target_h:
+                output_h = int(target_h)
+                output_w = max(1, int(round(output_h * ratio)))
+
             png_bytes = cairosvg.svg2png(
                 bytestring=svg_data,
-                output_width=size,
-                output_height=size,
+                output_width=output_w,
+                output_height=output_h,
             )
             logo = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
-            self._steam_logo_cache[size] = logo
+            self._steam_logo_cache[cache_key] = logo
             return logo
+        except Exception:
+            return None
+
+    @staticmethod
+    def _parse_svg_viewbox(svg_data: bytes) -> tuple[float, float, float, float] | None:
+        try:
+            text = svg_data.decode("utf-8", errors="ignore")
+            m = re.search(r'viewBox\s*=\s*"([^\"]+)"', text)
+            if not m:
+                return None
+            parts = [p for p in re.split(r"[\s,]+", m.group(1).strip()) if p]
+            if len(parts) != 4:
+                return None
+            return tuple(float(x) for x in parts)  # type: ignore[return-value]
         except Exception:
             return None
 
