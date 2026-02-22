@@ -105,7 +105,9 @@ class SteamWatch(Star):
         if not raw:
             yield event.plain_result(
                 "用法：\n"
-                "/steam 绑定 [好友码/64位id/好友链接/资料链接]\n"
+                "/steam 绑定 [好友码/64位id/好友链接/资料链接] [可选:qq]\n"
+                "/steam 解绑\n"
+                "/steam 状态测试 [可选:好友码/64位id/好友链接/资料链接]\n"
                 "/steam 订阅 [游戏链接/游戏id/游戏名称]\n"
                 "/steam 订阅测试 [游戏链接/游戏id/游戏名称]\n"
                 "/steam 自检"
@@ -116,11 +118,33 @@ class SteamWatch(Star):
         action = parts[0].strip()
         payload = parts[1].strip() if len(parts) > 1 else ""
 
-        if action in {"绑定", "订阅", "订阅测试", "bind", "subscribe", "sub", "subtest", "testsub"} and not payload:
+        if action in {
+            "绑定",
+            "解绑",
+            "状态测试",
+            "订阅",
+            "订阅测试",
+            "bind",
+            "unbind",
+            "status",
+            "statustest",
+            "subscribe",
+            "sub",
+            "subtest",
+            "testsub",
+        } and not payload:
             payload = self._extract_payload_from_message(event, action)
 
         if action in {"绑定", "bind"}:
             msg = await self._handle_bind(event, payload)
+            yield event.plain_result(msg)
+            return
+        if action in {"解绑", "unbind"}:
+            msg = await self._handle_unbind(event)
+            yield event.plain_result(msg)
+            return
+        if action in {"状态测试", "status", "statustest"}:
+            msg = await self._handle_status_test(event, payload)
             yield event.plain_result(msg)
             return
         if action in {"订阅", "subscribe","sub"}:
@@ -137,8 +161,12 @@ class SteamWatch(Star):
             return
 
         yield event.plain_result(
-            "未知子命令。可用：绑定、订阅、订阅测试、自检\n"
+            "未知子命令。可用：绑定、解绑、状态测试、订阅、订阅测试、自检\n"
             "示例：/steam 绑定 7656119xxxxxxxxxx\n"
+            "示例：/steam 绑定 7656119xxxxxxxxxx 123456789\n"
+            "示例：/steam 解绑\n"
+            "示例：/steam 状态测试\n"
+            "示例：/steam 状态测试 7656119xxxxxxxxxx\n"
             "示例：/steam 订阅 https://store.steampowered.com/app/730/\n"
             "示例：/steam 订阅测试 730\n"
             "示例：/steam 自检"
@@ -184,13 +212,36 @@ class SteamWatch(Star):
         if not event.get_group_id():
             return "请在群聊中执行绑定，才能将 Steam 状态推送到对应群。"
         if not raw_target:
-            return "用法：/steam 绑定 [好友码/64位id/好友链接/资料链接]"
+            return "用法：/steam 绑定 [好友码/64位id/好友链接/资料链接] [可选:qq]"
         if not self.steam_web_api_key:
             return "未配置 Steam Web API Key，请先在插件配置中填写。"
 
+        raw_parts = [x for x in str(raw_target).split() if x]
+        if not raw_parts:
+            return "用法：/steam 绑定 [好友码/64位id/好友链接/资料链接] [可选:qq]"
+        if len(raw_parts) > 2:
+            return "参数过多。用法：/steam 绑定 [好友码/64位id/好友链接/资料链接] [可选:qq]"
+
+        steam_target = raw_parts[0].strip()
+        qq_target = raw_parts[1].strip() if len(raw_parts) == 2 else ""
+
         platform = event.get_platform_name() or "unknown"
-        group_id = event.get_group_id()
-        sender_id = event.get_sender_id()
+        platform_id = event.get_platform_id() or ""
+        group_id = str(event.get_group_id() or "")
+
+        target_sender_id = str(event.get_sender_id() or "")
+        target_sender_name = event.get_sender_name() or "未知昵称"
+        if qq_target:
+            nickname_map = await self._fetch_group_nickname_map(
+                platform=platform,
+                platform_id=platform_id,
+                group_id=group_id,
+            )
+            if not nickname_map or qq_target not in nickname_map:
+                return "群内无此成员。"
+            target_sender_id = qq_target
+            target_sender_name = nickname_map.get(qq_target) or target_sender_name
+
         async with self._lock:
             for old in self._bindings:
                 if not isinstance(old, dict):
@@ -198,16 +249,20 @@ class SteamWatch(Star):
                 if (
                     str(old.get("platform") or "") == platform
                     and str(old.get("group_id") or "") == str(group_id)
-                    and str(old.get("sender_id") or "") == str(sender_id)
+                    and str(old.get("sender_id") or "") == str(target_sender_id)
                 ):
                     bound_name = str(old.get("steam_name") or old.get("steamid64") or "")
                     if bound_name:
+                        if qq_target:
+                            return f"该成员已经绑定过了（{bound_name}）。"
                         return f"你已经绑定过了（{bound_name}）。"
+                    if qq_target:
+                        return "该成员已经绑定过了。"
                     return "你已经绑定过了。"
 
         await self._ensure_http_client()
 
-        steamid64 = await self._resolve_steamid64(raw_target)
+        steamid64 = await self._resolve_steamid64(steam_target)
         if not steamid64:
             return "无法识别该 Steam 标识，请检查输入。"
 
@@ -222,19 +277,16 @@ class SteamWatch(Star):
 
         state, appid, game_name = self._extract_player_state(player)
         now = int(time.time())
-        sender_name = event.get_sender_name() or "未知昵称"
         platform = event.get_platform_name() or "unknown"
-        sender_id = event.get_sender_id()
-        group_id = event.get_group_id()
 
         record = {
             "id": uuid.uuid4().hex,
             "platform": platform,
-            "platform_id": event.get_platform_id(),
+            "platform_id": platform_id,
             "session": event.unified_msg_origin,
             "group_id": group_id,
-            "sender_id": sender_id,
-            "sender_name": sender_name,
+            "sender_id": target_sender_id,
+            "sender_name": target_sender_name,
             "steamid64": steamid64,
             "steam_name": str(player.get("personaname") or steamid64),
             "avatar_url": str(player.get("avatarfull") or ""),
@@ -252,12 +304,84 @@ class SteamWatch(Star):
 
         state_text = self._state_text(state)
         msg = (
-            f"绑定成功：{record['steam_name']} -> 群成员 {sender_name}({sender_id})\n"
+            f"绑定成功：{record['steam_name']} -> 群成员 {target_sender_name}({target_sender_id})\n"
             f"绑定群：{group_id}\n"
             f"当前状态：{state_text}"
         )
         if state == "in_game" and appid:
             msg += f"（{game_name}）"
+        return msg
+
+    async def _handle_unbind(self, event: AstrMessageEvent) -> str:
+        if not event.get_group_id():
+            return "请在群聊中执行解绑。"
+
+        platform = event.get_platform_name() or "unknown"
+        group_id = str(event.get_group_id() or "")
+        sender_id = str(event.get_sender_id() or "")
+
+        async with self._lock:
+            old_len = len(self._bindings)
+            self._bindings = [
+                b
+                for b in self._bindings
+                if not (
+                    isinstance(b, dict)
+                    and str(b.get("platform") or "") == platform
+                    and str(b.get("group_id") or "") == group_id
+                    and str(b.get("sender_id") or "") == sender_id
+                )
+            ]
+            removed = old_len - len(self._bindings)
+            if removed > 0:
+                await self._save_state_unlocked()
+
+        if removed > 0:
+            return "解绑成功：已移除你在本群的 Steam 绑定。"
+        return "你在本群还没有绑定，无需解绑。"
+
+    async def _handle_status_test(self, event: AstrMessageEvent, raw_target: str) -> str:
+        if not self.steam_web_api_key:
+            return "未配置 Steam Web API Key，请先在插件配置中填写。"
+
+        target = (raw_target or "").strip()
+        if not target and event.get_group_id():
+            platform = event.get_platform_name() or "unknown"
+            group_id = str(event.get_group_id() or "")
+            sender_id = str(event.get_sender_id() or "")
+            async with self._lock:
+                for b in self._bindings:
+                    if not isinstance(b, dict):
+                        continue
+                    if (
+                        str(b.get("platform") or "") == platform
+                        and str(b.get("group_id") or "") == group_id
+                        and str(b.get("sender_id") or "") == sender_id
+                    ):
+                        target = str(b.get("steamid64") or "").strip()
+                        break
+
+        if not target:
+            return "用法：/steam 状态测试 [可选:好友码/64位id/好友链接/资料链接]（不填则测试你当前绑定）"
+
+        await self._ensure_http_client()
+
+        steamid64 = await self._resolve_steamid64(target)
+        if not steamid64:
+            return "状态测试失败：无法识别该 Steam 标识。"
+
+        player = await self._fetch_player_summary(steamid64)
+        if not player:
+            return "状态测试失败：未获取到玩家信息。"
+
+        steam_name = str(player.get("personaname") or steamid64)
+        state, appid, game_name = self._extract_player_state(player)
+        state_text = self._state_text(state)
+        msg = f"状态测试结果：{steam_name}\nSteamID64: {steamid64}\n当前状态：{state_text}"
+        if state == "in_game" and appid > 0:
+            msg += f"\n当前游戏：{game_name} (AppID: {appid})"
+            playtime = await self._fetch_playtime_text(steamid64=steamid64, appid=appid)
+            msg += f"\n{playtime}"
         return msg
 
     async def _handle_subscribe_game(self, event: AstrMessageEvent, raw_game: str) -> str:

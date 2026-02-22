@@ -154,19 +154,20 @@ class SteamRenderer:
         font_small = self._load_font(18)
 
         draw.rounded_rectangle([(22, 18), (width - 22, 96)], radius=16, fill=(26, 38, 53))
-        draw.rounded_rectangle([(22, 18), (width - 22, 57)], radius=16, fill=(40, 57, 78))
+        draw.rounded_rectangle([(22, 18), (width - 22, 70)], radius=16, fill=(40, 57, 78))
         title_text = self._label(f"Steam 状态变化汇总 · {count} 人", f"Steam Status Update · {count}")
-        title_text = self._ellipsize_text(draw, title_text, font_title, width - 280)
+        title_font = self._fit_font_size(draw, title_text, 32, 18, width - 280, 30)
+        title_text = self._ellipsize_text(draw, title_text, title_font, width - 280)
         draw.text(
-            (38, 32),
+            (38, 28),
             title_text,
             fill=(236, 240, 245),
-            font=font_title,
+            font=title_font,
         )
         subtitle_text = self._label("本轮检测到状态变化（开始/结束游戏/在线变化）", "Detected state changes in this poll")
         subtitle_text = self._ellipsize_text(draw, subtitle_text, font_sub, width - 280)
         draw.text(
-            (40, 66),
+            (40, 72),
             subtitle_text,
             fill=(170, 196, 216),
             font=font_sub,
@@ -206,13 +207,42 @@ class SteamRenderer:
             if cover is None:
                 cover = Image.new("RGB", (102, 136), color=(55, 60, 68))
             cover = self._rounded_image(cover, (102, 136), 10)
-            canvas.paste(cover, (42, top + 16), cover)
+            row_top = top + 8
+            row_bottom = top + row_h - 10
+            row_height = row_bottom - row_top
+            cover_y = row_top + max(0, (row_height - 136) // 2)
+            canvas.paste(cover, (42, cover_y), cover)
 
             avatar = it.get("avatar")
             if avatar is None:
                 avatar = Image.new("RGB", (64, 64), color=(85, 90, 100))
             avatar = self._circle_image(avatar, 64)
-            canvas.paste(avatar, (156, top + 20), avatar)
+            avatar_x = 156
+            avatar_y = top + 20
+            canvas.paste(avatar, (avatar_x, avatar_y), avatar)
+
+            badge_text = self._label(self._state_text(ns), ns or "unknown")
+            badge_w = 72
+            badge_h = 22
+            badge_x1 = avatar_x - 4
+            badge_y1 = avatar_y + 72
+            badge_x2 = badge_x1 + badge_w
+            badge_y2 = badge_y1 + badge_h
+            draw.rounded_rectangle(
+                [(badge_x1, badge_y1), (badge_x2, badge_y2)],
+                radius=8,
+                fill=(45, 62, 84),
+            )
+            badge_font = self._load_font(15)
+            text_box = draw.textbbox((0, 0), badge_text, font=badge_font)
+            text_w = text_box[2] - text_box[0]
+            text_h = text_box[3] - text_box[1]
+            draw.text(
+                (badge_x1 + (badge_w - text_w) // 2, badge_y1 + (badge_h - text_h) // 2 - 1),
+                badge_text,
+                fill=bar_color,
+                font=badge_font,
+            )
 
             raw_name = str(it.get("display_name") or "未知")
             name = self._shorten_display_name(raw_name, group_max_chars=10)
@@ -393,9 +423,10 @@ class SteamRenderer:
         font_text = self._load_font(24)
         font_small = self._load_font(20)
 
-        display = self._ellipsize_text(draw, display, font_title, 458)
+        title_font = self._fit_font_size(draw, display, 34, 20, 458, 44)
+        display = self._ellipsize_text(draw, display, title_font, 458)
         game_name = self._ellipsize_text(draw, game_name, font_text, 458)
-        draw.text((right_x, 36), display, fill=(240, 240, 240), font=font_title)
+        draw.text((right_x, 36), display, fill=(240, 240, 240), font=title_font)
         draw.text((right_x, 92), game_name, fill=(173, 216, 230), font=font_text)
         draw.text((right_x, 136), playtime_text, fill=(200, 200, 200), font=font_small)
 
@@ -654,6 +685,26 @@ class SteamRenderer:
                 group_name = group_name[:group_max_chars] + "..."
             return f"{steam_name}({group_name})"
         return text
+
+    def _fit_font_size(
+        self,
+        draw,
+        text: str,
+        start_size: int,
+        min_size: int,
+        max_width: int,
+        max_height: int,
+    ):
+        size = max(min_size, start_size)
+        while size >= min_size:
+            font = self._load_font(size)
+            box = draw.textbbox((0, 0), text, font=font)
+            width = box[2] - box[0]
+            height = box[3] - box[1]
+            if width <= max_width and height <= max_height:
+                return font
+            size -= 1
+        return self._load_font(min_size)
 
     @staticmethod
     def _wrap_text(draw, text: str, font, max_width: int) -> list[str]:
