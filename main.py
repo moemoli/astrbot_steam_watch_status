@@ -107,6 +107,7 @@ class SteamWatch(Star):
                 "用法：\n"
                 "/steam 绑定 [好友码/64位id/好友链接/资料链接]\n"
                 "/steam 订阅 [游戏链接/游戏id/游戏名称]\n"
+                "/steam 订阅测试 [游戏链接/游戏id/游戏名称]\n"
                 "/steam 自检"
             )
             return
@@ -115,7 +116,7 @@ class SteamWatch(Star):
         action = parts[0].strip()
         payload = parts[1].strip() if len(parts) > 1 else ""
 
-        if action in {"绑定", "订阅","bind", "subscribe", "sub"} and not payload:
+        if action in {"绑定", "订阅", "订阅测试", "bind", "subscribe", "sub", "subtest", "testsub"} and not payload:
             payload = self._extract_payload_from_message(event, action)
 
         if action in {"绑定", "bind"}:
@@ -126,15 +127,20 @@ class SteamWatch(Star):
             msg = await self._handle_subscribe_game(event, payload)
             yield event.plain_result(msg)
             return
+        if action in {"订阅测试", "subtest", "testsub"}:
+            msg = await self._handle_subscribe_test(event, payload)
+            yield event.plain_result(msg)
+            return
         if action in {"自检", "check", "diag"}:
             msg = self._handle_self_check()
             yield event.plain_result(msg)
             return
 
         yield event.plain_result(
-            "未知子命令。可用：绑定、订阅、自检\n"
+            "未知子命令。可用：绑定、订阅、订阅测试、自检\n"
             "示例：/steam 绑定 7656119xxxxxxxxxx\n"
             "示例：/steam 订阅 https://store.steampowered.com/app/730/\n"
+            "示例：/steam 订阅测试 730\n"
             "示例：/steam 自检"
         )
 
@@ -295,6 +301,47 @@ class SteamWatch(Star):
             await self._save_state_unlocked()
 
         return f"订阅成功：{rec['game_name']} (AppID: {rec['appid']})\n后续该游戏有新更新公告时会在本群推送。"
+
+    async def _handle_subscribe_test(self, event: AstrMessageEvent, raw_game: str) -> str:
+        if not raw_game:
+            return "用法：/steam 订阅测试 [游戏链接/游戏id/游戏名称]"
+
+        await self._ensure_http_client()
+
+        app = await self._resolve_app(raw_game)
+        if not app:
+            return "无法解析游戏，请输入正确的游戏链接、AppID 或游戏名称。"
+
+        appid = int(app.get("appid") or 0)
+        game_name = str(app.get("name") or f"App {appid}")
+        latest = await self._fetch_latest_news(appid)
+        if not latest:
+            return f"测试完成：未获取到 {game_name} 的新闻。"
+
+        title = str(latest.get("title") or "新公告")
+        url = str(latest.get("url") or "")
+        author = str(latest.get("author") or "Steam News")
+        contents = str(latest.get("contents") or "")
+        date_ts = int(latest.get("date") or 0)
+
+        card = await self._render_news_card(
+            appid=appid,
+            game_name=game_name,
+            title=title,
+            author=author,
+            date_ts=date_ts,
+            contents=contents,
+        )
+
+        text = f"[Steam订阅测试] {game_name}\n{title}"
+        if url:
+            text += f"\n{url}"
+        chain = MessageChain().message(text)
+        if card:
+            chain.file_image(card)
+        await self.context.send_message(event.unified_msg_origin, chain)
+
+        return f"测试完成：已拉取并推送 {game_name} 的最新新闻。"
 
     async def _ensure_http_client(self) -> None:
         if self._http and not self._http.closed:
