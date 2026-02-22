@@ -854,6 +854,7 @@ class SteamWatch(Star):
         avatar_url = str(change.get("avatar_url") or "")
         session_secs = int(change.get("session_secs") or 0)
         network_jitter = bool(change.get("network_jitter"))
+        render_state = new_state
 
         avatar = await self._fetch_image_pil(avatar_url)
         cover = None
@@ -879,7 +880,8 @@ class SteamWatch(Star):
                 game_name=game_name or "该游戏",
                 duration_text=playtime_text,
             )
-            status_desc = f"结束游戏 -> {self._state_text(new_state)}"
+            status_desc = "游戏结束"
+            render_state = "ended"
         else:
             status_desc = f"{self._state_text(old_state)} -> {self._state_text(new_state)}"
 
@@ -894,7 +896,7 @@ class SteamWatch(Star):
             "comment_text": comment_text,
             "avatar": avatar,
             "cover": cover,
-            "new_state": new_state,
+            "new_state": render_state,
         }
 
     async def _generate_llm_comment(

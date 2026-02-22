@@ -132,8 +132,8 @@ class SteamRenderer:
 
         count = len(entries)
         width = 900
-        header_h = 104
-        row_h = 178
+        header_h = 112
+        row_h = 188
         padding = 22
         height = header_h + row_h * count + padding
 
@@ -153,8 +153,8 @@ class SteamRenderer:
         font_text = self._load_font(20)
         font_small = self._load_font(18)
 
-        draw.rounded_rectangle([(22, 18), (width - 22, 96)], radius=16, fill=(26, 38, 53))
-        draw.rounded_rectangle([(22, 18), (width - 22, 70)], radius=16, fill=(40, 57, 78))
+        draw.rounded_rectangle([(22, 18), (width - 22, 104)], radius=16, fill=(26, 38, 53))
+        draw.rounded_rectangle([(22, 18), (width - 22, 62)], radius=16, fill=(40, 57, 78))
         title_text = self._label(f"Steam 状态变化汇总 · {count} 人", f"Steam Status Update · {count}")
         title_font = self._fit_font_size(draw, title_text, 32, 18, width - 280, 30)
         title_text = self._ellipsize_text(draw, title_text, title_font, width - 280)
@@ -167,7 +167,7 @@ class SteamRenderer:
         subtitle_text = self._label("本轮检测到状态变化（开始/结束游戏/在线变化）", "Detected state changes in this poll")
         subtitle_text = self._ellipsize_text(draw, subtitle_text, font_sub, width - 280)
         draw.text(
-            (40, 72),
+            (40, 70),
             subtitle_text,
             fill=(170, 196, 216),
             font=font_sub,
@@ -178,6 +178,7 @@ class SteamRenderer:
             "in_game": (122, 235, 160),
             "online": (100, 190, 255),
             "offline": (170, 170, 170),
+            "ended": (255, 188, 120),
         }
 
         for idx, it in enumerate(entries):
@@ -280,7 +281,7 @@ class SteamRenderer:
                 draw.text((236, top + 126), playtime, fill=(200, 200, 200), font=font_small)
             if comment_text:
                 draw.text(
-                    (236, top + 150),
+                    (236, top + 148),
                     self._label(
                         f"评价：{self._truncate_text(draw, comment_text, font_small, width - 290)}",
                         f"Comment: {self._truncate_text(draw, comment_text, font_small, width - 290)}",
@@ -519,6 +520,8 @@ class SteamRenderer:
     def _state_text(state: str) -> str:
         if state == "in_game":
             return "游戏中"
+        if state == "ended":
+            return "游戏结束"
         if state == "online":
             return "在线"
         if state == "offline":
@@ -529,6 +532,8 @@ class SteamRenderer:
     def _status_symbol(state: str) -> str:
         if state == "in_game":
             return ">"
+        if state == "ended":
+            return "!"
         if state == "online":
             return "*"
         if state == "offline":
