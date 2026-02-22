@@ -1,24 +1,529 @@
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
-from astrbot.api.star import Context, Star, register
-from astrbot.api import logger
+from __future__ import annotations
 
-@register("helloworld", "YourName", "一个简单的 Hello World 插件", "1.0.0")
-class MyPlugin(Star):
-    def __init__(self, context: Context):
-        super().__init__(context)
+import asyncio
+import time
+import uuid
+from pathlib import Path
+
+import aiohttp
+from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.star import Context, Star, register
+from astrbot.core.star.filter.command import GreedyStr
+from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
+from .steam_api import SteamApi
+from .steam_render import SteamRenderer
+from .steam_store import SteamStateStore
+
+
+@register("astrbot_steam_watch_status", "moemoli", "Steam 状态监控插件", "0.0.1")
+class SteamWatch(Star):
+    _global_poll_task: asyncio.Task | None = None
+
+    def __init__(self, context: Context, config=None):
+        super().__init__(context, config)
+        self.config = config or {}
+        self.steam_web_api_key = (self.config or {}).get("steam_web_api_key", "")
+        self.steamgriddb_api_key = (self.config or {}).get("steamgriddb_api_key", "")
+        self._store = SteamStateStore(
+            Path(get_astrbot_plugin_data_path()) / "astrbot_steam_watch_status"
+        )
+        self._api = SteamApi(self.steam_web_api_key, self.steamgriddb_api_key)
+        self._renderer = SteamRenderer(self._store.cards_dir())
+
+        self._lock = asyncio.Lock()
+        self._stop = False
+        self._poll_task: asyncio.Task | None = None
+        self._http: aiohttp.ClientSession | None = None
+
+        self._bindings: list[dict] = []
+        self._game_subscriptions: list[dict] = []
 
     async def initialize(self):
-        """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
+        if self._poll_task and not self._poll_task.done():
+            logger.warning("steam watch poll task already running on current instance, skip re-initialize")
+            return
 
-    # 注册指令的装饰器。指令名为 helloworld。注册成功后，发送 `/helloworld` 就会触发这个指令，并回复 `你好, {user_name}!`
-    @filter.command("helloworld")
-    async def helloworld(self, event: AstrMessageEvent):
-        """这是一个 hello world 指令""" # 这是 handler 的描述，将会被解析方便用户了解插件内容。建议填写。
-        user_name = event.get_sender_name()
-        message_str = event.message_str # 用户发的纯文本消息字符串
-        message_chain = event.get_messages() # 用户所发的消息的消息链 # from astrbot.api.message_components import *
-        logger.info(message_chain)
-        yield event.plain_result(f"Hello, {user_name}, 你发了 {message_str}!") # 发送一条纯文本消息
+        if SteamWatch._global_poll_task and not SteamWatch._global_poll_task.done():
+            logger.warning("found existing steam watch poll task, cancelling stale task before starting new one")
+            SteamWatch._global_poll_task.cancel()
+            try:
+                await SteamWatch._global_poll_task
+            except BaseException:
+                pass
+            SteamWatch._global_poll_task = None
+
+        self._ensure_data_dir()
+        await self._load_state()
+        self._http = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=20),
+            headers={"User-Agent": "astrbot-steam-watch-status/0.0.1"},
+        )
+        self._api.http = self._http
+        self._stop = False
+        self._poll_task = asyncio.create_task(self._poll_loop())
+        SteamWatch._global_poll_task = self._poll_task
 
     async def terminate(self):
-        """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""
+        self._stop = True
+        task = self._poll_task
+        self._poll_task = None
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except BaseException:
+                pass
+        if SteamWatch._global_poll_task is task:
+            SteamWatch._global_poll_task = None
+
+        if self._http and not self._http.closed:
+            await self._http.close()
+        self._http = None
+        self._api.http = None
+
+    @filter.command("steam")
+    async def steam(self, event: AstrMessageEvent, args: GreedyStr = GreedyStr()):
+        raw = (str(args) or "").strip()
+        if not raw:
+            yield event.plain_result(
+                "用法：\n"
+                "/steam 绑定 [好友码/64位id/好友链接/资料链接]\n"
+                "/steam 订阅 [游戏链接/游戏id/游戏名称]"
+            )
+            return
+
+        parts = raw.split(maxsplit=1)
+        action = parts[0].strip()
+        payload = parts[1].strip() if len(parts) > 1 else ""
+
+        if action == "绑定":
+            msg = await self._handle_bind(event, payload)
+            yield event.plain_result(msg)
+            return
+        if action == "订阅":
+            msg = await self._handle_subscribe_game(event, payload)
+            yield event.plain_result(msg)
+            return
+
+        yield event.plain_result(
+            "未知子命令。可用：绑定、订阅\n"
+            "示例：/steam 绑定 7656119xxxxxxxxxx\n"
+            "示例：/steam 订阅 https://store.steampowered.com/app/730/"
+        )
+
+    async def _handle_bind(self, event: AstrMessageEvent, raw_target: str) -> str:
+        if not event.get_group_id():
+            return "请在群聊中执行绑定，才能将 Steam 状态推送到对应群。"
+        if not raw_target:
+            return "用法：/steam 绑定 [好友码/64位id/好友链接/资料链接]"
+        if not self.steam_web_api_key:
+            return "未配置 Steam Web API Key，请先在插件配置中填写。"
+
+        steamid64 = await self._resolve_steamid64(raw_target)
+        if not steamid64:
+            return "无法识别该 Steam 标识，请检查输入。"
+
+        player = await self._fetch_player_summary(steamid64)
+        if not player:
+            return "获取玩家信息失败，请确认 Steam Web API Key 与目标账号可见性。"
+
+        state, appid, game_name = self._extract_player_state(player)
+        now = int(time.time())
+        sender_name = event.get_sender_name() or "未知昵称"
+        platform = event.get_platform_name() or "unknown"
+        sender_id = event.get_sender_id()
+        group_id = event.get_group_id()
+
+        record = {
+            "id": uuid.uuid4().hex,
+            "platform": platform,
+            "session": event.unified_msg_origin,
+            "group_id": group_id,
+            "sender_id": sender_id,
+            "sender_name": sender_name,
+            "steamid64": steamid64,
+            "steam_name": str(player.get("personaname") or steamid64),
+            "avatar_url": str(player.get("avatarfull") or ""),
+            "last_state": state,
+            "last_appid": appid,
+            "last_game_name": game_name,
+            "last_change_ts": now,
+            "created_ts": now,
+        }
+
+        async with self._lock:
+            replaced = False
+            for idx, old in enumerate(self._bindings):
+                if (
+                    str(old.get("platform")) == platform
+                    and str(old.get("group_id")) == group_id
+                    and str(old.get("sender_id")) == sender_id
+                ):
+                    record["id"] = str(old.get("id") or record["id"])
+                    self._bindings[idx] = record
+                    replaced = True
+                    break
+            if not replaced:
+                self._bindings.append(record)
+            await self._save_state_unlocked()
+
+        state_text = self._state_text(state)
+        msg = (
+            f"绑定成功：{record['steam_name']} -> 群成员 {sender_name}({sender_id})\n"
+            f"绑定群：{group_id}\n"
+            f"当前状态：{state_text}"
+        )
+        if state == "in_game" and appid:
+            msg += f"（{game_name}）"
+        return msg
+
+    async def _handle_subscribe_game(self, event: AstrMessageEvent, raw_game: str) -> str:
+        if not event.get_group_id():
+            return "请在群聊中执行订阅，游戏更新会推送到该群。"
+        if not raw_game:
+            return "用法：/steam 订阅 [游戏链接/游戏id/游戏名称]"
+
+        app = await self._resolve_app(raw_game)
+        if not app:
+            return "无法解析游戏，请输入正确的游戏链接、AppID 或游戏名称。"
+
+        platform = event.get_platform_name() or "unknown"
+        group_id = event.get_group_id()
+        now = int(time.time())
+        latest_gid = await self._fetch_latest_news_gid(app["appid"])
+
+        rec = {
+            "id": uuid.uuid4().hex,
+            "platform": platform,
+            "group_id": group_id,
+            "session": event.unified_msg_origin,
+            "appid": app["appid"],
+            "game_name": app["name"],
+            "store_url": app["url"],
+            "last_news_gid": latest_gid,
+            "created_ts": now,
+        }
+
+        async with self._lock:
+            for old in self._game_subscriptions:
+                if (
+                    str(old.get("platform")) == platform
+                    and str(old.get("group_id")) == group_id
+                    and int(old.get("appid") or 0) == int(rec["appid"])
+                ):
+                    return f"此群已订阅：{rec['game_name']} (AppID: {rec['appid']})"
+            self._game_subscriptions.append(rec)
+            await self._save_state_unlocked()
+
+        return f"订阅成功：{rec['game_name']} (AppID: {rec['appid']})\n后续该游戏有新更新公告时会在本群推送。"
+
+    async def _poll_loop(self) -> None:
+        try:
+            while not self._stop:
+                try:
+                    await self._poll_player_status_once()
+                    await self._poll_game_news_once()
+                    await asyncio.sleep(60)
+                except asyncio.CancelledError:
+                    return
+                except Exception as exc:
+                    logger.warning(f"steam watch poll error: {exc!s}")
+                    await asyncio.sleep(20)
+        finally:
+            current = asyncio.current_task()
+            if SteamWatch._global_poll_task is current:
+                SteamWatch._global_poll_task = None
+
+    async def _poll_player_status_once(self) -> None:
+        async with self._lock:
+            bindings = [dict(x) for x in self._bindings if isinstance(x, dict)]
+
+        if not bindings:
+            return
+
+        ids = []
+        for b in bindings:
+            sid = str(b.get("steamid64") or "").strip()
+            if sid:
+                ids.append(sid)
+
+        players = await self._fetch_player_summaries(ids)
+        if not players:
+            return
+
+        updates: dict[str, dict] = {}
+        changes_by_session: dict[str, list[dict]] = {}
+        for b in bindings:
+            bid = str(b.get("id") or "").strip()
+            sid = str(b.get("steamid64") or "").strip()
+            if not bid or not sid:
+                continue
+            player = players.get(sid)
+            if not player:
+                continue
+
+            steam_name = str(player.get("personaname") or sid)
+            avatar = str(player.get("avatarfull") or "")
+            new_state, new_appid, new_game = self._extract_player_state(player)
+            old_state = str(b.get("last_state") or "")
+            old_appid = int(b.get("last_appid") or 0)
+
+            b["steam_name"] = steam_name
+            b["avatar_url"] = avatar
+
+            if not old_state:
+                b["last_state"] = new_state
+                b["last_appid"] = new_appid
+                b["last_game_name"] = new_game
+                b["last_change_ts"] = int(time.time())
+                updates[bid] = b
+                continue
+
+            changed = new_state != old_state or (
+                new_state == "in_game" and int(new_appid or 0) != int(old_appid or 0)
+            )
+            if changed:
+                session = str(b.get("session") or "").strip()
+                if session:
+                    changes_by_session.setdefault(session, []).append(
+                        {
+                            "steam_name": steam_name,
+                            "group_nick": str(b.get("sender_name") or "未知成员"),
+                            "steamid64": sid,
+                            "avatar_url": avatar,
+                            "old_state": old_state,
+                            "new_state": new_state,
+                            "new_appid": int(new_appid or 0),
+                            "new_game": new_game or (f"App {new_appid}" if new_appid else ""),
+                        }
+                    )
+                b["last_state"] = new_state
+                b["last_appid"] = new_appid
+                b["last_game_name"] = new_game
+                b["last_change_ts"] = int(time.time())
+
+            updates[bid] = b
+
+        for session, changes in changes_by_session.items():
+            await self._push_group_state_changes(session, changes)
+
+        if updates:
+            async with self._lock:
+                self._bindings = [
+                    updates.get(str(old.get("id") or ""), old)
+                    for old in self._bindings
+                    if isinstance(old, dict)
+                ]
+                await self._save_state_unlocked()
+
+    async def _push_group_state_changes(self, session: str, changes: list[dict]) -> None:
+        if not session or not changes:
+            return
+
+        enriched_list = await asyncio.gather(
+            *(self._build_change_entry(c) for c in changes),
+            return_exceptions=True,
+        )
+
+        enriched: list[dict] = []
+        lines: list[str] = []
+        for item in enriched_list:
+            if isinstance(item, Exception) or not isinstance(item, dict):
+                continue
+            enriched.append(item)
+            lines.append(f"- {item.get('display_name', '未知')}：{item.get('status_desc', '')}")
+
+        if not enriched:
+            return
+
+        card = await self._render_batch_status_card(enriched)
+        head = f"[Steam状态] 本轮状态更新 {len(enriched)} 人"
+        body = "\n".join(lines[:8])
+        if len(lines) > 8:
+            body += f"\n...其余 {len(lines) - 8} 人见图片"
+
+        chain = MessageChain().message(f"{head}\n{body}" if body else head)
+        if card:
+            chain.file_image(card)
+        await self.context.send_message(session, chain)
+
+    async def _build_change_entry(self, change: dict) -> dict:
+        steam_name = str(change.get("steam_name") or "未知")
+        group_nick = str(change.get("group_nick") or "未知成员")
+        display_name = f"{steam_name}({group_nick})"
+        old_state = str(change.get("old_state") or "")
+        new_state = str(change.get("new_state") or "")
+        appid = int(change.get("new_appid") or 0)
+        game_name = str(change.get("new_game") or "")
+        steamid64 = str(change.get("steamid64") or "")
+        avatar_url = str(change.get("avatar_url") or "")
+
+        avatar = await self._fetch_image_pil(avatar_url)
+        cover = None
+        playtime_text = ""
+
+        if new_state == "in_game" and appid > 0:
+            playtime_text = await self._fetch_playtime_text(steamid64=steamid64, appid=appid)
+            cover = await self._fetch_cover_image(appid)
+            status_desc = f"开始游戏：{game_name}"
+        elif old_state == "in_game" and new_state in {"online", "offline"}:
+            status_desc = f"结束游戏 -> {self._state_text(new_state)}"
+        else:
+            status_desc = f"{self._state_text(old_state)} -> {self._state_text(new_state)}"
+
+        return {
+            "display_name": display_name,
+            "status_desc": status_desc,
+            "game_name": game_name,
+            "playtime_text": playtime_text,
+            "avatar": avatar,
+            "cover": cover,
+            "new_state": new_state,
+        }
+
+    async def _poll_game_news_once(self) -> None:
+        async with self._lock:
+            subs = [dict(x) for x in self._game_subscriptions if isinstance(x, dict)]
+        if not subs:
+            return
+
+        updates: dict[str, dict] = {}
+        for s in subs:
+            sid = str(s.get("id") or "").strip()
+            if not sid:
+                continue
+            appid = int(s.get("appid") or 0)
+            if appid <= 0:
+                updates[sid] = s
+                continue
+
+            latest = await self._fetch_latest_news(appid)
+            if not latest:
+                updates[sid] = s
+                continue
+
+            old_gid = str(s.get("last_news_gid") or "")
+            new_gid = str(latest.get("gid") or "")
+            if old_gid and new_gid and old_gid != new_gid:
+                title = str(latest.get("title") or "新公告")
+                url = str(latest.get("url") or "")
+                game_name = str(s.get("game_name") or f"App {appid}")
+                author = str(latest.get("author") or "Steam News")
+                contents = str(latest.get("contents") or "")
+                date_ts = int(latest.get("date") or 0)
+                card = await self._render_news_card(
+                    appid=appid,
+                    game_name=game_name,
+                    title=title,
+                    author=author,
+                    date_ts=date_ts,
+                    contents=contents,
+                )
+
+                text = f"[Steam更新] {game_name}\n{title}"
+                if url:
+                    text += f"\n{url}"
+                chain = MessageChain().message(text)
+                if card:
+                    chain.file_image(card)
+                await self.context.send_message(str(s.get("session") or ""), chain)
+
+            s["last_news_gid"] = new_gid or old_gid
+            updates[sid] = s
+
+        if updates:
+            async with self._lock:
+                self._game_subscriptions = [
+                    updates.get(str(old.get("id") or ""), old)
+                    for old in self._game_subscriptions
+                    if isinstance(old, dict)
+                ]
+                await self._save_state_unlocked()
+
+    async def _resolve_steamid64(self, raw: str) -> str | None:
+        return await self._api.resolve_steamid64(raw)
+
+    async def _fetch_player_summary(self, steamid64: str) -> dict | None:
+        return await self._api.fetch_player_summary(steamid64)
+
+    async def _fetch_player_summaries(self, steamids: list[str]) -> dict[str, dict]:
+        return await self._api.fetch_player_summaries(steamids)
+
+    def _extract_player_state(self, player: dict) -> tuple[str, int, str]:
+        return self._api.extract_player_state(player)
+
+    def _state_text(self, state: str) -> str:
+        return self._api.state_text(state)
+
+    async def _fetch_playtime_text(self, steamid64: str, appid: int) -> str:
+        return await self._api.fetch_playtime_text(steamid64, appid)
+
+    async def _resolve_app(self, raw: str) -> dict | None:
+        return await self._api.resolve_app(raw)
+
+    async def _fetch_latest_news_gid(self, appid: int) -> str:
+        return await self._api.fetch_latest_news_gid(appid)
+
+    async def _fetch_latest_news(self, appid: int) -> dict | None:
+        return await self._api.fetch_latest_news(appid)
+
+    async def _render_playing_card(
+        self,
+        *,
+        steam_name: str,
+        group_name: str,
+        game_name: str,
+        avatar_url: str,
+        appid: int,
+        playtime_text: str,
+    ) -> str | None:
+        cover = await self._fetch_cover_image(appid)
+        avatar = await self._fetch_image_pil(avatar_url)
+        return await self._renderer.render_playing_card(
+            steam_name=steam_name,
+            group_name=group_name,
+            game_name=game_name,
+            playtime_text=playtime_text,
+            cover=cover,
+            avatar=avatar,
+        )
+
+    async def _render_batch_status_card(self, entries: list[dict]) -> str | None:
+        return await self._renderer.render_batch_status_card(entries)
+
+    async def _render_news_card(
+        self,
+        *,
+        appid: int,
+        game_name: str,
+        title: str,
+        author: str,
+        date_ts: int,
+        contents: str,
+    ) -> str | None:
+        cover = await self._fetch_cover_image(appid)
+        return await self._renderer.render_news_card(
+            appid=appid,
+            game_name=game_name,
+            title=title,
+            author=author,
+            date_ts=date_ts,
+            contents=contents,
+            cover=cover,
+        )
+
+    async def _fetch_cover_image(self, appid: int):
+        return await self._api.fetch_cover_image(appid)
+
+    async def _fetch_image_pil(self, url: str):
+        return await self._api.fetch_image_pil(url)
+
+    def _ensure_data_dir(self) -> None:
+        self._store.ensure_data_dir()
+
+    async def _load_state(self) -> None:
+        self._bindings, self._game_subscriptions = await self._store.load_state()
+
+    async def _save_state_unlocked(self) -> None:
+        await self._store.save_state(self._bindings, self._game_subscriptions)

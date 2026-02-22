@@ -1,0 +1,14 @@
+{
+    "steam_web_api_key": {
+        "type": "string",
+        "default": "",
+        "description": "Steam Web API Key",
+        "hint": "用于游戏与好友状态拉取，请在 https://steamcommunity.com/dev/apikey 获取"
+    },
+    "steamgriddb_api_key": {
+        "type": "string",
+        "default": "",
+        "description": "SteamGridDB API Key",
+        "hint": "用于游戏封面获取，请在 https://www.steamgriddb.com/profile/preferences/api 获取"
+    }
+}
