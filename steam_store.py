@@ -6,8 +6,9 @@ from pathlib import Path
 
 
 class SteamStateStore:
-    def __init__(self, base_dir: Path):
+    def __init__(self, base_dir: Path, cards_dir: Path | None = None):
         self._base_dir = base_dir
+        self._cards_dir = cards_dir
 
     def ensure_data_dir(self) -> None:
         self.base_dir().mkdir(parents=True, exist_ok=True)
@@ -17,7 +18,7 @@ class SteamStateStore:
         return self._base_dir
 
     def cards_dir(self) -> Path:
-        return self.base_dir() / "cards"
+        return self._cards_dir if self._cards_dir else (self.base_dir() / "cards")
 
     def state_file(self) -> Path:
         return self.base_dir() / "state.json"

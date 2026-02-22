@@ -12,7 +12,7 @@ from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.provider import Provider
 from astrbot.api.star import Context, Star, register
 from astrbot.core.star.filter.command import GreedyStr
-from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
+from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path, get_astrbot_temp_path
 from .steam_api import SteamApi
 from .steam_render import SteamRenderer
 from .steam_store import SteamStateStore
@@ -38,8 +38,10 @@ class SteamWatch(Star):
         self.poll_interval_sec = self._parse_poll_interval_sec(
             (self.config or {}).get("poll_interval_sec", "60")
         )
+        temp_cards_dir = Path(get_astrbot_temp_path()) / "astrbot_steam_watch_status" / "cards"
         self._store = SteamStateStore(
-            Path(get_astrbot_plugin_data_path()) / "astrbot_steam_watch_status"
+            Path(get_astrbot_plugin_data_path()) / "astrbot_steam_watch_status",
+            cards_dir=temp_cards_dir,
         )
         self._api = SteamApi(self.steam_web_api_key, self.steamgriddb_api_key)
         self._renderer = SteamRenderer(self._store.cards_dir())
