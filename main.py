@@ -59,6 +59,7 @@ class SteamWatch(Star):
         self._http = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=20),
             headers={"User-Agent": "astrbot-steam-watch-status/0.0.1"},
+            trust_env=True,
         )
         self._api.http = self._http
         self._stop = False
@@ -255,6 +256,7 @@ class SteamWatch(Star):
         self._http = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=20),
             headers={"User-Agent": "astrbot-steam-watch-status/0.0.1"},
+            trust_env=True,
         )
         self._api.http = self._http
 
