@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 import uuid
 from pathlib import Path
@@ -97,11 +98,14 @@ class SteamWatch(Star):
         action = parts[0].strip()
         payload = parts[1].strip() if len(parts) > 1 else ""
 
-        if action == "绑定":
+        if action in {"绑定", "订阅","bind", "subscribe", "sub"} and not payload:
+            payload = self._extract_payload_from_message(event, action)
+
+        if action in {"绑定", "bind"}:
             msg = await self._handle_bind(event, payload)
             yield event.plain_result(msg)
             return
-        if action == "订阅":
+        if action in {"订阅", "subscribe","sub"}:
             msg = await self._handle_subscribe_game(event, payload)
             yield event.plain_result(msg)
             return
@@ -111,6 +115,22 @@ class SteamWatch(Star):
             "示例：/steam 绑定 7656119xxxxxxxxxx\n"
             "示例：/steam 订阅 https://store.steampowered.com/app/730/"
         )
+
+    def _extract_payload_from_message(self, event: AstrMessageEvent, action: str) -> str:
+        msg = (event.get_message_str() or "").strip()
+        if not msg:
+            return ""
+
+        patterns = [
+            rf"^\s*/?steam\s+{re.escape(action)}\s+(.+?)\s*$",
+            rf"^\s*steam\s+{re.escape(action)}\s+(.+?)\s*$",
+            rf"^\s*{re.escape(action)}\s+(.+?)\s*$",
+        ]
+        for p in patterns:
+            m = re.match(p, msg, re.IGNORECASE)
+            if m:
+                return (m.group(1) or "").strip()
+        return ""
 
     async def _handle_bind(self, event: AstrMessageEvent, raw_target: str) -> str:
         if not event.get_group_id():
@@ -138,6 +158,7 @@ class SteamWatch(Star):
         record = {
             "id": uuid.uuid4().hex,
             "platform": platform,
+            "platform_id": event.get_platform_id(),
             "session": event.unified_msg_origin,
             "group_id": group_id,
             "sender_id": sender_id,
@@ -242,6 +263,8 @@ class SteamWatch(Star):
         if not bindings:
             return
 
+        await self._refresh_group_nicknames_for_bindings(bindings)
+
         ids = []
         for b in bindings:
             sid = str(b.get("steamid64") or "").strip()
@@ -259,8 +282,10 @@ class SteamWatch(Star):
             sid = str(b.get("steamid64") or "").strip()
             if not bid or not sid:
                 continue
+
             player = players.get(sid)
             if not player:
+                updates[bid] = b
                 continue
 
             steam_name = str(player.get("personaname") or sid)
@@ -316,6 +341,86 @@ class SteamWatch(Star):
                     if isinstance(old, dict)
                 ]
                 await self._save_state_unlocked()
+
+    async def _refresh_group_nicknames_for_bindings(self, bindings: list[dict]) -> None:
+        grouped: dict[tuple[str, str, str], list[dict]] = {}
+        for binding in bindings:
+            platform = str(binding.get("platform") or "")
+            platform_id = str(binding.get("platform_id") or "")
+            group_id = str(binding.get("group_id") or "")
+            if not group_id:
+                continue
+            key = (platform, platform_id, group_id)
+            grouped.setdefault(key, []).append(binding)
+
+        for (platform, platform_id, group_id), members in grouped.items():
+            nickname_map = await self._fetch_group_nickname_map(
+                platform=platform,
+                platform_id=platform_id,
+                group_id=group_id,
+            )
+            if not nickname_map:
+                continue
+
+            for binding in members:
+                sender_id = str(binding.get("sender_id") or "")
+                latest = nickname_map.get(sender_id)
+                if latest:
+                    normalized = latest.strip()
+                    if normalized:
+                        binding["sender_name"] = normalized
+
+    async def _fetch_group_nickname_map(
+        self,
+        *,
+        platform: str,
+        platform_id: str,
+        group_id: str,
+    ) -> dict[str, str]:
+        if platform != "aiocqhttp":
+            return {}
+
+        try:
+            platform_inst = None
+            if platform_id:
+                platform_inst = self.context.get_platform_inst(platform_id)
+            if not platform_inst:
+                platform_inst = self.context.get_platform("aiocqhttp")
+            if not platform_inst or not hasattr(platform_inst, "bot"):
+                return {}
+
+            bot = getattr(platform_inst, "bot", None)
+            if not bot:
+                return {}
+
+            result = await bot.call_action(
+                action="get_group_member_list",
+                group_id=int(group_id),
+                no_cache=False,
+            )
+        except Exception as exc:
+            logger.debug(f"fetch group member list failed: {exc!s}")
+            return {}
+
+        data = result
+        if isinstance(result, dict) and "data" in result:
+            data = result.get("data")
+        if not isinstance(data, list):
+            return {}
+
+        out: dict[str, str] = {}
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            user_id = str(item.get("user_id") or "").strip()
+            if not user_id:
+                continue
+            card = str(item.get("card") or "").strip()
+            nick = str(item.get("nickname") or item.get("nick") or "").strip()
+            name = card or nick
+            if name:
+                out[user_id] = name
+        return out
 
     async def _push_group_state_changes(self, session: str, changes: list[dict]) -> None:
         if not session or not changes:
