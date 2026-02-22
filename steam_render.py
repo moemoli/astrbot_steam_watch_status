@@ -155,15 +155,19 @@ class SteamRenderer:
 
         draw.rounded_rectangle([(22, 18), (width - 22, 96)], radius=16, fill=(26, 38, 53))
         draw.rounded_rectangle([(22, 18), (width - 22, 57)], radius=16, fill=(40, 57, 78))
+        title_text = self._label(f"Steam 状态变化汇总 · {count} 人", f"Steam Status Update · {count}")
+        title_text = self._ellipsize_text(draw, title_text, font_title, width - 280)
         draw.text(
             (38, 32),
-            self._label(f"Steam 状态变化汇总 · {count} 人", f"Steam Status Update · {count}"),
+            title_text,
             fill=(236, 240, 245),
             font=font_title,
         )
+        subtitle_text = self._label("本轮检测到状态变化（开始/结束游戏/在线变化）", "Detected state changes in this poll")
+        subtitle_text = self._ellipsize_text(draw, subtitle_text, font_sub, width - 280)
         draw.text(
             (40, 66),
-            self._label("本轮检测到状态变化（开始/结束游戏/在线变化）", "Detected state changes in this poll"),
+            subtitle_text,
             fill=(170, 196, 216),
             font=font_sub,
         )
@@ -210,14 +214,16 @@ class SteamRenderer:
             avatar = self._circle_image(avatar, 64)
             canvas.paste(avatar, (156, top + 20), avatar)
 
-            name = str(it.get("display_name") or "未知")
+            raw_name = str(it.get("display_name") or "未知")
+            name = self._shorten_display_name(raw_name, group_max_chars=10)
             status_desc = str(it.get("status_desc") or "")
             game_name = str(it.get("game_name") or "")
             playtime = str(it.get("playtime_text") or "")
             comment_text = str(it.get("comment_text") or "")
 
             status_symbol = self._status_symbol(ns)
-            draw.text((236, top + 22), f"{status_symbol} {name}", fill=(245, 245, 245), font=font_name)
+            name_line = self._ellipsize_text(draw, f"{status_symbol} {name}", font_name, width - 410)
+            draw.text((236, top + 22), name_line, fill=(245, 245, 245), font=font_name)
             draw.text((236, top + 62), status_desc, fill=(169, 223, 255), font=font_text)
 
             tag_w = 120
@@ -381,12 +387,14 @@ class SteamRenderer:
         canvas.paste(left, (0, 0))
 
         right_x = 272
-        display = f"{steam_name}({group_name})"
+        display = self._shorten_display_name(f"{steam_name}({group_name})", group_max_chars=10)
 
         font_title = self._load_font(34)
         font_text = self._load_font(24)
         font_small = self._load_font(20)
 
+        display = self._ellipsize_text(draw, display, font_title, 458)
+        game_name = self._ellipsize_text(draw, game_name, font_text, 458)
         draw.text((right_x, 36), display, fill=(240, 240, 240), font=font_title)
         draw.text((right_x, 92), game_name, fill=(173, 216, 230), font=font_text)
         draw.text((right_x, 136), playtime_text, fill=(200, 200, 200), font=font_small)
@@ -613,6 +621,39 @@ class SteamRenderer:
                 return curr
             curr = curr[:-1]
         return ""
+
+    @staticmethod
+    def _ellipsize_text(draw, text: str, font, max_width: int) -> str:
+        if not text:
+            return ""
+        text = text.strip()
+        box = draw.textbbox((0, 0), text, font=font)
+        if box[2] - box[0] <= max_width:
+            return text
+        ellipsis = "..."
+        current = text
+        while current:
+            candidate = current + ellipsis
+            box = draw.textbbox((0, 0), candidate, font=font)
+            if box[2] - box[0] <= max_width:
+                return candidate
+            current = current[:-1]
+        return ellipsis
+
+    @staticmethod
+    def _shorten_display_name(display_name: str, group_max_chars: int = 10) -> str:
+        text = (display_name or "").strip()
+        if not text:
+            return text
+        left = text.rfind("(")
+        right = text.rfind(")")
+        if left >= 0 and right > left:
+            steam_name = text[:left]
+            group_name = text[left + 1 : right]
+            if len(group_name) > group_max_chars:
+                group_name = group_name[:group_max_chars] + "..."
+            return f"{steam_name}({group_name})"
+        return text
 
     @staticmethod
     def _wrap_text(draw, text: str, font, max_width: int) -> list[str]:
