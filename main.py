@@ -342,13 +342,9 @@ class SteamWatch(Star):
             return "", ""
         if len(parts) == 1:
             return parts[0].strip(), ""
-
-        last = parts[-1].strip()
-        if re.fullmatch(r"\d{5,12}", last):
-            steam_target = " ".join(parts[:-1]).strip()
-            return steam_target, last
-
-        return " ".join(parts).strip(), ""
+        if len(parts) == 2:
+            return parts[0].strip(), parts[1].strip()
+        return "", ""
 
     async def _handle_unbind(self, event: AstrMessageEvent) -> str:
         if not event.get_group_id():
