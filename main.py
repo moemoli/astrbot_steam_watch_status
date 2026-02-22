@@ -24,8 +24,8 @@ class SteamWatch(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context, config)
         self.config = config or {}
-        self.steam_web_api_key = (self.config or {}).get("steam_web_api_key", "")
-        self.steamgriddb_api_key = (self.config or {}).get("steamgriddb_api_key", "")
+        self.steam_web_api_key = str((self.config or {}).get("steam_web_api_key", "")).strip()
+        self.steamgriddb_api_key = str((self.config or {}).get("steamgriddb_api_key", "")).strip()
         self._store = SteamStateStore(
             Path(get_astrbot_plugin_data_path()) / "astrbot_steam_watch_status"
         )
@@ -140,13 +140,20 @@ class SteamWatch(Star):
         if not self.steam_web_api_key:
             return "未配置 Steam Web API Key，请先在插件配置中填写。"
 
+        await self._ensure_http_client()
+
         steamid64 = await self._resolve_steamid64(raw_target)
         if not steamid64:
             return "无法识别该 Steam 标识，请检查输入。"
 
         player = await self._fetch_player_summary(steamid64)
         if not player:
-            return "获取玩家信息失败，请确认 Steam Web API Key 与目标账号可见性。"
+            return (
+                "获取玩家信息失败。请确认：\n"
+                "1) Steam Web API Key 可用且已去除首尾空格；\n"
+                "2) 目标账号资料可公开读取；\n"
+                "3) 网络可访问 api.steampowered.com。"
+            )
 
         state, appid, game_name = self._extract_player_state(player)
         now = int(time.time())
@@ -205,6 +212,8 @@ class SteamWatch(Star):
         if not raw_game:
             return "用法：/steam 订阅 [游戏链接/游戏id/游戏名称]"
 
+        await self._ensure_http_client()
+
         app = await self._resolve_app(raw_game)
         if not app:
             return "无法解析游戏，请输入正确的游戏链接、AppID 或游戏名称。"
@@ -238,6 +247,16 @@ class SteamWatch(Star):
             await self._save_state_unlocked()
 
         return f"订阅成功：{rec['game_name']} (AppID: {rec['appid']})\n后续该游戏有新更新公告时会在本群推送。"
+
+    async def _ensure_http_client(self) -> None:
+        if self._http and not self._http.closed:
+            self._api.http = self._http
+            return
+        self._http = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=20),
+            headers={"User-Agent": "astrbot-steam-watch-status/0.0.1"},
+        )
+        self._api.http = self._http
 
     async def _poll_loop(self) -> None:
         try:

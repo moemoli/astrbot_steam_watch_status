@@ -18,8 +18,8 @@ STEAM_ID64_BASE = 76561197960265728
 
 class SteamApi:
     def __init__(self, steam_web_api_key: str, steamgriddb_api_key: str):
-        self.steam_web_api_key = steam_web_api_key
-        self.steamgriddb_api_key = steamgriddb_api_key
+        self.steam_web_api_key = (steam_web_api_key or "").strip()
+        self.steamgriddb_api_key = (steamgriddb_api_key or "").strip()
         self.http: aiohttp.ClientSession | None = None
 
     def _http(self) -> aiohttp.ClientSession | None:
