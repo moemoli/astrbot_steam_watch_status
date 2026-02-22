@@ -106,7 +106,8 @@ class SteamWatch(Star):
             yield event.plain_result(
                 "用法：\n"
                 "/steam 绑定 [好友码/64位id/好友链接/资料链接]\n"
-                "/steam 订阅 [游戏链接/游戏id/游戏名称]"
+                "/steam 订阅 [游戏链接/游戏id/游戏名称]\n"
+                "/steam 自检"
             )
             return
 
@@ -125,12 +126,37 @@ class SteamWatch(Star):
             msg = await self._handle_subscribe_game(event, payload)
             yield event.plain_result(msg)
             return
+        if action in {"自检", "check", "diag"}:
+            msg = self._handle_self_check()
+            yield event.plain_result(msg)
+            return
 
         yield event.plain_result(
-            "未知子命令。可用：绑定、订阅\n"
+            "未知子命令。可用：绑定、订阅、自检\n"
             "示例：/steam 绑定 7656119xxxxxxxxxx\n"
-            "示例：/steam 订阅 https://store.steampowered.com/app/730/"
+            "示例：/steam 订阅 https://store.steampowered.com/app/730/\n"
+            "示例：/steam 自检"
         )
+
+    def _handle_self_check(self) -> str:
+        diag = self._renderer.runtime_diagnostics()
+        lines = [
+            "[Steam插件自检]",
+            f"- pillow: {diag.get('pillow', 'unknown')}",
+            f"- cairosvg: {diag.get('cairosvg', 'unknown')}",
+            f"- fonts_dir: {diag.get('fonts_dir', 'unknown')}",
+            f"- logo_svg: {diag.get('logo_svg', 'unknown')}",
+            f"- selected_font: {diag.get('selected_font', 'unknown')}",
+            f"- font_runtime: {diag.get('font_runtime', 'unknown')}",
+            f"- svg_runtime: {diag.get('svg_runtime', 'unknown')}",
+            f"- steam_web_api_key: {'set' if self.steam_web_api_key else 'missing'}",
+            f"- steamgriddb_api_key: {'set' if self.steamgriddb_api_key else 'missing'}",
+        ]
+        if diag.get("svg_runtime") != "ok":
+            lines.append("提示：请确认运行环境已安装 CairoSVG，并重启 AstrBot。")
+        if diag.get("font_runtime") != "ok":
+            lines.append("提示：请确认 fonts 目录字体可读，且 Pillow 含 FreeType 支持。")
+        return "\n".join(lines)
 
     def _extract_payload_from_message(self, event: AstrMessageEvent, action: str) -> str:
         msg = (event.get_message_str() or "").strip()
@@ -155,6 +181,23 @@ class SteamWatch(Star):
             return "用法：/steam 绑定 [好友码/64位id/好友链接/资料链接]"
         if not self.steam_web_api_key:
             return "未配置 Steam Web API Key，请先在插件配置中填写。"
+
+        platform = event.get_platform_name() or "unknown"
+        group_id = event.get_group_id()
+        sender_id = event.get_sender_id()
+        async with self._lock:
+            for old in self._bindings:
+                if not isinstance(old, dict):
+                    continue
+                if (
+                    str(old.get("platform") or "") == platform
+                    and str(old.get("group_id") or "") == str(group_id)
+                    and str(old.get("sender_id") or "") == str(sender_id)
+                ):
+                    bound_name = str(old.get("steam_name") or old.get("steamid64") or "")
+                    if bound_name:
+                        return f"你已经绑定过了（{bound_name}）。"
+                    return "你已经绑定过了。"
 
         await self._ensure_http_client()
 
@@ -198,19 +241,7 @@ class SteamWatch(Star):
         }
 
         async with self._lock:
-            replaced = False
-            for idx, old in enumerate(self._bindings):
-                if (
-                    str(old.get("platform")) == platform
-                    and str(old.get("group_id")) == group_id
-                    and str(old.get("sender_id")) == sender_id
-                ):
-                    record["id"] = str(old.get("id") or record["id"])
-                    self._bindings[idx] = record
-                    replaced = True
-                    break
-            if not replaced:
-                self._bindings.append(record)
+            self._bindings.append(record)
             await self._save_state_unlocked()
 
         state_text = self._state_text(state)

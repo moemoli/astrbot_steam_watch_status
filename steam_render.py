@@ -33,6 +33,27 @@ class SteamRenderer:
         self._logo_warned = False
         self._font_warned = False
 
+    def _label(self, zh: str, en: str) -> str:
+        return zh if self._selected_font_path else en
+
+    def runtime_diagnostics(self) -> dict[str, str]:
+        plugin_dir = self._cards_dir.parent
+        fonts_dir = plugin_dir / "fonts"
+        logo_svg = plugin_dir / "assets" / "logo_steam.svg"
+
+        font_obj = self._load_font(20)
+        logo_obj = self._load_steam_logo_icon(134, 30)
+
+        return {
+            "pillow": "ok" if Image is not None and ImageFont is not None else "missing",
+            "cairosvg": "ok" if cairosvg is not None else "missing",
+            "fonts_dir": "exists" if fonts_dir.exists() else "missing",
+            "logo_svg": "exists" if logo_svg.exists() else "missing",
+            "selected_font": self._selected_font_path or "none",
+            "font_runtime": "ok" if font_obj is not None else "failed",
+            "svg_runtime": "ok" if logo_obj is not None else "failed",
+        }
+
     async def render_playing_card(
         self,
         *,
@@ -113,8 +134,18 @@ class SteamRenderer:
 
         draw.rounded_rectangle([(22, 18), (width - 22, 96)], radius=16, fill=(26, 38, 53))
         draw.rounded_rectangle([(22, 18), (width - 22, 57)], radius=16, fill=(40, 57, 78))
-        draw.text((38, 32), f"Steam 状态变化汇总 · {count} 人", fill=(236, 240, 245), font=font_title)
-        draw.text((40, 66), "本轮检测到状态变化（开始/结束游戏/在线变化）", fill=(170, 196, 216), font=font_sub)
+        draw.text(
+            (38, 32),
+            self._label(f"Steam 状态变化汇总 · {count} 人", f"Steam Status Update · {count}"),
+            fill=(236, 240, 245),
+            font=font_title,
+        )
+        draw.text(
+            (40, 66),
+            self._label("本轮检测到状态变化（开始/结束游戏/在线变化）", "Detected state changes in this poll"),
+            fill=(170, 196, 216),
+            font=font_sub,
+        )
         self._draw_steam_badge(canvas, draw, width - 194, 30)
 
         state_color = {
@@ -176,26 +207,37 @@ class SteamRenderer:
             )
             draw.text(
                 (width - tag_w - 18, top + 28),
-                self._state_text(ns),
+                self._label(self._state_text(ns), ns or "unknown"),
                 fill=bar_color,
                 font=font_small,
             )
 
             if game_name:
-                draw.text((236, top + 98), f"游戏：{game_name}", fill=(220, 220, 220), font=font_small)
+                draw.text(
+                    (236, top + 98),
+                    self._label(f"游戏：{game_name}", f"Game: {game_name}"),
+                    fill=(220, 220, 220),
+                    font=font_small,
+                )
             if playtime:
                 draw.text((236, top + 126), playtime, fill=(200, 200, 200), font=font_small)
             if comment_text:
                 draw.text(
                     (236, top + 150),
-                    f"评价：{self._truncate_text(draw, comment_text, font_small, width - 290)}",
+                    self._label(
+                        f"评价：{self._truncate_text(draw, comment_text, font_small, width - 290)}",
+                        f"Comment: {self._truncate_text(draw, comment_text, font_small, width - 290)}",
+                    ),
                     fill=(158, 204, 236),
                     font=font_small,
                 )
 
         draw.text(
             (width - 250, height - 22),
-            time.strftime("生成于 %Y-%m-%d %H:%M:%S", time.localtime()),
+            self._label(
+                time.strftime("生成于 %Y-%m-%d %H:%M:%S", time.localtime()),
+                time.strftime("Generated at %Y-%m-%d %H:%M:%S", time.localtime()),
+            ),
             fill=(130, 150, 168),
             font=self._load_font(14),
         )
@@ -253,14 +295,29 @@ class SteamRenderer:
             draw.text((334, y), ln, fill=(240, 240, 240), font=font_title)
             y += 36
 
-        meta_time = time.strftime("%Y-%m-%d %H:%M", time.localtime(date_ts)) if date_ts > 0 else "未知时间"
-        draw.text((334, 206), f"作者：{author or 'Steam'}", fill=(170, 196, 216), font=font_meta)
-        draw.text((334, 232), f"时间：{meta_time}", fill=(170, 196, 216), font=font_meta)
+        meta_time = time.strftime("%Y-%m-%d %H:%M", time.localtime(date_ts)) if date_ts > 0 else self._label("未知时间", "unknown")
+        draw.text(
+            (334, 206),
+            self._label(f"作者：{author or 'Steam'}", f"Author: {author or 'Steam'}"),
+            fill=(170, 196, 216),
+            font=font_meta,
+        )
+        draw.text(
+            (334, 232),
+            self._label(f"时间：{meta_time}", f"Time: {meta_time}"),
+            fill=(170, 196, 216),
+            font=font_meta,
+        )
 
         body = (contents or "").replace("\r", "").replace("\n\n", "\n").replace("\n", " ").strip()
         if len(body) > 210:
             body = body[:210].rstrip() + "..."
-        body_lines = self._wrap_text(draw, body or "请点击链接查看完整公告内容。", font_body, width - 354)
+        body_lines = self._wrap_text(
+            draw,
+            body or self._label("请点击链接查看完整公告内容。", "Please open the link for full details."),
+            font_body,
+            width - 354,
+        )
 
         by = 280
         for ln in body_lines[:6]:
@@ -269,7 +326,7 @@ class SteamRenderer:
 
         draw.text(
             (width - 210, height - 34),
-            "来自 Steam News",
+            self._label("来自 Steam News", "From Steam News"),
             fill=(130, 150, 168),
             font=self._load_font(16),
         )
@@ -316,7 +373,12 @@ class SteamRenderer:
         avatar = self._circle_image(avatar, 96)
         canvas.paste(avatar, (right_x, 206), avatar)
         self._draw_steam_badge(canvas, draw, 560, 24)
-        draw.text((right_x + 114, 236), "状态：游戏中", fill=(122, 255, 160), font=font_text)
+        draw.text(
+            (right_x + 114, 236),
+            self._label("状态：游戏中", "Status: in game"),
+            fill=(122, 255, 160),
+            font=font_text,
+        )
 
         out = self._cards_dir / f"steam_{int(time.time())}_{uuid.uuid4().hex[:8]}.png"
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -420,9 +482,11 @@ class SteamRenderer:
             lx = x + (160 - logo.width) // 2
             ly = y + (48 - logo.height) // 2
             canvas.paste(logo, (lx, ly), logo)
-        elif not self._logo_warned:
-            logger.warning("[steam-watch] steam logo svg render failed; badge will be hidden")
-            self._logo_warned = True
+        else:
+            draw.text((x + 40, y + 13), "STEAM", fill=(215, 230, 245), font=self._load_font(20))
+            if not self._logo_warned:
+                logger.warning("[steam-watch] steam logo svg render failed; use text fallback")
+                self._logo_warned = True
 
     def _load_steam_logo_icon(self, target_w: int, target_h: int):
         if Image is None:
