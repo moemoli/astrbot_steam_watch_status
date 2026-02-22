@@ -34,6 +34,7 @@ class SteamWatch(Star):
         self.steamgriddb_api_key = str((self.config or {}).get("steamgriddb_api_key", "")).strip()
         self.llm_provider_id = str((self.config or {}).get("llm_provider_id", "")).strip()
         self.llm_comment_prompt = str((self.config or {}).get("llm_comment_prompt", "")).strip()
+        self.verbose_poll_log = self._parse_bool((self.config or {}).get("verbose_poll_log", False))
         self.poll_interval_sec = self._parse_poll_interval_sec(
             (self.config or {}).get("poll_interval_sec", "60")
         )
@@ -76,6 +77,9 @@ class SteamWatch(Star):
         self._stop = False
         self._poll_task = asyncio.create_task(self._poll_loop())
         SteamWatch._global_poll_task = self._poll_task
+        self._poll_log(
+            f"poll task started | interval={self.poll_interval_sec}s | verbose_poll_log={self.verbose_poll_log}"
+        )
 
     async def terminate(self):
         self._stop = True
@@ -273,11 +277,30 @@ class SteamWatch(Star):
         self._api.http = self._http
 
     async def _poll_loop(self) -> None:
+        iteration = 0
         try:
             while not self._stop:
+                iteration += 1
+                loop_start = time.perf_counter()
                 try:
-                    await self._poll_player_status_once()
-                    await self._poll_game_news_once()
+                    player_stats = await self._poll_player_status_once()
+                    news_stats = await self._poll_game_news_once()
+                    elapsed_ms = int((time.perf_counter() - loop_start) * 1000)
+                    self._poll_log(
+                        "poll#%s done | bindings=%s valid_ids=%s players=%s changed_users=%s changed_sessions=%s | subs=%s pushed_news=%s | elapsed=%sms | next_in=%ss"
+                        % (
+                            iteration,
+                            player_stats.get("bindings", 0),
+                            player_stats.get("valid_ids", 0),
+                            player_stats.get("players", 0),
+                            player_stats.get("changed_users", 0),
+                            player_stats.get("changed_sessions", 0),
+                            news_stats.get("subscriptions", 0),
+                            news_stats.get("pushed_news", 0),
+                            elapsed_ms,
+                            self.poll_interval_sec,
+                        )
+                    )
                     await asyncio.sleep(self.poll_interval_sec)
                 except asyncio.CancelledError:
                     return
@@ -289,12 +312,18 @@ class SteamWatch(Star):
             if SteamWatch._global_poll_task is current:
                 SteamWatch._global_poll_task = None
 
-    async def _poll_player_status_once(self) -> None:
+    async def _poll_player_status_once(self) -> dict[str, int]:
         async with self._lock:
             bindings = [dict(x) for x in self._bindings if isinstance(x, dict)]
 
         if not bindings:
-            return
+            return {
+                "bindings": 0,
+                "valid_ids": 0,
+                "players": 0,
+                "changed_users": 0,
+                "changed_sessions": 0,
+            }
 
         await self._refresh_group_nicknames_for_bindings(bindings)
 
@@ -306,7 +335,13 @@ class SteamWatch(Star):
 
         players = await self._fetch_player_summaries(ids)
         if not players:
-            return
+            return {
+                "bindings": len(bindings),
+                "valid_ids": len(ids),
+                "players": 0,
+                "changed_users": 0,
+                "changed_sessions": 0,
+            }
 
         updates: dict[str, dict] = {}
         changes_by_session: dict[str, list[dict]] = {}
@@ -388,6 +423,15 @@ class SteamWatch(Star):
                     if isinstance(old, dict)
                 ]
                 await self._save_state_unlocked()
+
+        changed_users = sum(len(v) for v in changes_by_session.values())
+        return {
+            "bindings": len(bindings),
+            "valid_ids": len(ids),
+            "players": len(players),
+            "changed_users": changed_users,
+            "changed_sessions": len(changes_by_session),
+        }
 
     async def _refresh_group_nicknames_for_bindings(self, bindings: list[dict]) -> None:
         grouped: dict[tuple[str, str, str], list[dict]] = {}
@@ -615,13 +659,14 @@ class SteamWatch(Star):
             return f"{minutes}分{sec}秒"
         return f"{sec}秒"
 
-    async def _poll_game_news_once(self) -> None:
+    async def _poll_game_news_once(self) -> dict[str, int]:
         async with self._lock:
             subs = [dict(x) for x in self._game_subscriptions if isinstance(x, dict)]
         if not subs:
-            return
+            return {"subscriptions": 0, "pushed_news": 0}
 
         updates: dict[str, dict] = {}
+        pushed_news = 0
         for s in subs:
             sid = str(s.get("id") or "").strip()
             if not sid:
@@ -661,6 +706,7 @@ class SteamWatch(Star):
                 if card:
                     chain.file_image(card)
                 await self.context.send_message(str(s.get("session") or ""), chain)
+                pushed_news += 1
 
             s["last_news_gid"] = new_gid or old_gid
             updates[sid] = s
@@ -673,6 +719,7 @@ class SteamWatch(Star):
                     if isinstance(old, dict)
                 ]
                 await self._save_state_unlocked()
+        return {"subscriptions": len(subs), "pushed_news": pushed_news}
 
     async def _resolve_steamid64(self, raw: str) -> str | None:
         return await self._api.resolve_steamid64(raw)
@@ -770,3 +817,14 @@ class SteamWatch(Star):
         if val < 10:
             return 10
         return val
+
+    @staticmethod
+    def _parse_bool(raw: object) -> bool:
+        if isinstance(raw, bool):
+            return raw
+        text = str(raw).strip().lower()
+        return text in {"1", "true", "yes", "on", "y", "t"}
+
+    def _poll_log(self, message: str) -> None:
+        if self.verbose_poll_log:
+            logger.info(f"[steam-watch] {message}")

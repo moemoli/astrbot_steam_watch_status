@@ -17,6 +17,12 @@
         "description": "轮询间隔（秒）",
         "hint": "用于状态与资讯轮询间隔，单位秒。建议 >= 30；过小可能触发接口限流。"
     },
+    "verbose_poll_log": {
+        "type": "boolean",
+        "default": false,
+        "description": "详细轮询日志",
+        "hint": "开启后每次轮询都会输出详细日志（绑定数、变化数、订阅数、耗时等）。"
+    },
     "llm_provider_id": {
         "type": "string",
         "default": "",

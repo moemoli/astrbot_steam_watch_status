@@ -8,6 +8,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from astrbot.api import logger
+
 try:
     import cairosvg
 except Exception:  # pragma: no cover
@@ -27,6 +29,9 @@ class SteamRenderer:
         self._cards_dir = cards_dir
         self._steam_logo_cache: dict[tuple[int, int], Any] = {}
         self._font_cache: dict[tuple[str, int], Any] = {}
+        self._selected_font_path: str | None = None
+        self._logo_warned = False
+        self._font_warned = False
 
     async def render_playing_card(
         self,
@@ -322,32 +327,51 @@ class SteamRenderer:
         if ImageFont is None:
             return None
         plugin_fonts = self._cards_dir.parent / "fonts"
-        candidates: list[str] = []
-
-        preferred = [
-            plugin_fonts / "NotoSansHans-Medium.otf",
-            plugin_fonts / "NotoSansHans-Regular.otf",
-        ]
-        for fp in preferred:
-            if fp.exists():
-                candidates.append(str(fp))
-
-        if plugin_fonts.exists():
-            for ext in ("*.otf", "*.ttf", "*.ttc"):
-                for fp in sorted(plugin_fonts.glob(ext)):
-                    p = str(fp)
-                    if p not in candidates:
-                        candidates.append(p)
-
-        candidates.extend(
-            [
-                "C:/Windows/Fonts/msyh.ttc",
-                "C:/Windows/Fonts/simhei.ttf",
-                "C:/Windows/Fonts/msyhbd.ttc",
+        if not self._selected_font_path:
+            candidates: list[str] = []
+            preferred = [
+                plugin_fonts / "NotoSansHans-Medium.otf",
+                plugin_fonts / "NotoSansHans-Regular.otf",
             ]
-        )
+            for fp in preferred:
+                if fp.exists():
+                    candidates.append(str(fp))
+
+            if plugin_fonts.exists():
+                for ext in ("*.otf", "*.ttf", "*.ttc"):
+                    for fp in sorted(plugin_fonts.glob(ext)):
+                        p = str(fp)
+                        if p not in candidates:
+                            candidates.append(p)
+
+            candidates.extend(
+                [
+                    "C:/Windows/Fonts/msyh.ttc",
+                    "C:/Windows/Fonts/simhei.ttf",
+                    "C:/Windows/Fonts/msyhbd.ttc",
+                ]
+            )
+            for p in candidates:
+                try:
+                    ImageFont.truetype(p, size=16, encoding="unic")
+                    self._selected_font_path = p
+                    logger.info(f"[steam-watch] selected font: {p}")
+                    break
+                except Exception:
+                    try:
+                        data = Path(p).read_bytes()
+                        ImageFont.truetype(io.BytesIO(data), size=16, encoding="unic")
+                        self._selected_font_path = p
+                        logger.info(f"[steam-watch] selected font(by bytes): {p}")
+                        break
+                    except Exception:
+                        continue
+
+        candidates = [self._selected_font_path] if self._selected_font_path else []
 
         for p in candidates:
+            if not p:
+                continue
             key = (p, size)
             if key in self._font_cache:
                 return self._font_cache[key]
@@ -363,6 +387,10 @@ class SteamRenderer:
                     return font
                 except Exception:
                     continue
+
+        if not self._font_warned:
+            logger.warning("[steam-watch] no usable truetype font found, fallback to Pillow default font (may cause garbled text)")
+            self._font_warned = True
         return ImageFont.load_default()
 
     @staticmethod
@@ -378,12 +406,12 @@ class SteamRenderer:
     @staticmethod
     def _status_symbol(state: str) -> str:
         if state == "in_game":
-            return "▶"
+            return ">"
         if state == "online":
-            return "●"
+            return "*"
         if state == "offline":
-            return "○"
-        return "•"
+            return "-"
+        return "."
 
     def _draw_steam_badge(self, canvas, draw, x: int, y: int) -> None:
         draw.rounded_rectangle([(x, y), (x + 160, y + 48)], radius=10, fill=(34, 51, 74))
@@ -392,10 +420,9 @@ class SteamRenderer:
             lx = x + (160 - logo.width) // 2
             ly = y + (48 - logo.height) // 2
             canvas.paste(logo, (lx, ly), logo)
-        else:
-            draw.ellipse([(x + 12, y + 12), (x + 36, y + 36)], fill=(180, 205, 225))
-            draw.text((x + 19, y + 13), "S", fill=(34, 51, 74), font=self._load_font(18))
-            draw.text((x + 44, y + 13), "STEAM", fill=(215, 230, 245), font=self._load_font(20))
+        elif not self._logo_warned:
+            logger.warning("[steam-watch] steam logo svg render failed; badge will be hidden")
+            self._logo_warned = True
 
     def _load_steam_logo_icon(self, target_w: int, target_h: int):
         if Image is None:
@@ -406,6 +433,12 @@ class SteamRenderer:
 
         logo_svg = self._cards_dir.parent / "assets" / "logo_steam.svg"
         if not logo_svg.exists() or cairosvg is None:
+            if not self._logo_warned:
+                if not logo_svg.exists():
+                    logger.warning("[steam-watch] assets/logo_steam.svg not found")
+                if cairosvg is None:
+                    logger.warning("[steam-watch] CairoSVG unavailable, cannot render svg logo")
+                self._logo_warned = True
             return None
 
         try:
