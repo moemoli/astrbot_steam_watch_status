@@ -258,8 +258,8 @@ class SteamWatch(Star):
         )
 
     @steam.command("解绑", alias={"unbind"})
-    async def unbind(self, event: AstrMessageEvent):
-        msg = await self._handle_unbind(event)
+    async def unbind(self, event: AstrMessageEvent, target: str | None = None):
+        msg = await self._handle_unbind(event, target)
         yield event.plain_result(msg)
 
     @steam.command("状态测试", alias={"status", "statustest"})
@@ -283,6 +283,12 @@ class SteamWatch(Star):
         if msg:
             yield event.plain_result(msg)
 
+    @steam.command("我", alias={"me", "my"})
+    async def me_status(self, event: AstrMessageEvent):
+        msg = await self._handle_me_status(event)
+        if msg:
+            yield event.plain_result(msg)
+
     @steam.command("自检", alias={"check", "diag"})
     async def self_check(self, event: AstrMessageEvent):
         msg = self._handle_self_check()
@@ -296,12 +302,11 @@ class SteamWatch(Star):
     def _steam_help_text() -> str:
         return (
             "用法：\n"
-            "/steam 绑定 [好友码/64位id/好友链接/资料链接] [可选:qq]\n"
-            "/steam 解绑\n"
-            "/steam 状态测试 [可选:好友码/64位id/好友链接/资料链接]\n"
+            "/steam bind [好友码/64位id/好友链接/资料链接] [可选:qq]\n"
+            "/steam unbind [steamid64|all]\n"
             "/steam 订阅 [游戏链接/游戏id/游戏名称]\n"
-            "/steam 订阅测试 [游戏链接/游戏id/游戏名称]\n"
-            "/steam 自检"
+            "/steam list\n"
+            "/steam me\n"
         )
 
     def _handle_self_check(self) -> str:
@@ -352,33 +357,88 @@ class SteamWatch(Star):
         text = re.sub(r"\s+", " ", text).strip()
         return text
 
-    async def _handle_unbind(self, event: AstrMessageEvent) -> str:
+    async def _handle_unbind(self, event: AstrMessageEvent, target: str | None = None) -> str:
         if not event.get_group_id():
             return "请在群聊中执行解绑。"
 
         platform = event.get_platform_name() or "unknown"
         group_id = str(event.get_group_id() or "")
         sender_id = str(event.get_sender_id() or "")
+        target_text = str(target or "").strip()
+        target_lower = target_text.lower()
 
         async with self._lock:
-            old_len = len(self._bindings)
+            my_bindings = [
+                b
+                for b in self._bindings
+                if isinstance(b, dict)
+                and str(b.get("platform") or "") == platform
+                and str(b.get("group_id") or "") == group_id
+                and str(b.get("sender_id") or "") == sender_id
+            ]
+            if not my_bindings:
+                return "你在本群还没有绑定，无需解绑。"
+
+            if not target_text:
+                if len(my_bindings) == 1:
+                    hit = my_bindings[0]
+                    hit_id = str(hit.get("id") or "")
+                    self._bindings = [
+                        b
+                        for b in self._bindings
+                        if not (isinstance(b, dict) and str(b.get("id") or "") == hit_id)
+                    ]
+                    await self._save_state_unlocked()
+                    steamid64 = str(hit.get("steamid64") or "未知")
+                    steam_name = str(hit.get("steam_name") or steamid64)
+                    return f"解绑成功：已移除 {steam_name} ({steamid64})。"
+
+                lines = [
+                    "检测到你在本群绑定了多个 Steam 账号，请指定要解绑的目标：",
+                    "用法：/steam unbind <steamid64|all>",
+                ]
+                for item in my_bindings:
+                    steamid64 = str(item.get("steamid64") or "").strip()
+                    steam_name = str(item.get("steam_name") or steamid64 or "未知")
+                    if steamid64:
+                        lines.append(f"- {steam_name} ({steamid64})")
+                lines.append("- all (全部解绑)")
+                return "\n".join(lines)
+
+            if target_lower in {"all", "全部"}:
+                remove_ids = {str(b.get("id") or "") for b in my_bindings}
+                self._bindings = [
+                    b
+                    for b in self._bindings
+                    if not (isinstance(b, dict) and str(b.get("id") or "") in remove_ids)
+                ]
+                await self._save_state_unlocked()
+                return f"解绑成功：已移除你在本群的 {len(remove_ids)} 条 Steam 绑定。"
+            
+            steamid64 = await self._resolve_steamid64(str(target_text).strip())
+            if not steamid64:
+                return "绑定失败：无法识别该 Steam 标识。"
+            
+            chosen = None
+            for item in my_bindings:
+                if str(item.get("steamid64") or "").strip() == steamid64:
+                    chosen = item
+                    break
+
+            if not chosen:
+                return "未找到该 steamid64 绑定，请输入 /steam unbind 查看可解绑列表。"
+
+            chosen_id = str(chosen.get("id") or "")
             self._bindings = [
                 b
                 for b in self._bindings
-                if not (
-                    isinstance(b, dict)
-                    and str(b.get("platform") or "") == platform
-                    and str(b.get("group_id") or "") == group_id
-                    and str(b.get("sender_id") or "") == sender_id
-                )
+                if not (isinstance(b, dict) and str(b.get("id") or "") == chosen_id)
             ]
-            removed = old_len - len(self._bindings)
-            if removed > 0:
-                await self._save_state_unlocked()
+            await self._save_state_unlocked()
 
-        if removed > 0:
-            return "解绑成功：已移除你在本群的 Steam 绑定。"
-        return "你在本群还没有绑定，无需解绑。"
+            steamid64 = str(chosen.get("steamid64") or steamid64)
+            steam_name = str(chosen.get("steam_name") or steamid64)
+            return f"解绑成功：已移除 {steam_name} ({steamid64})。"
 
     async def _handle_status_test(
         self, event: AstrMessageEvent, raw_target: str
@@ -512,6 +572,80 @@ class SteamWatch(Star):
         await self.context.send_message(event.unified_msg_origin, chain)
 
         return f"测试完成：已拉取并推送 {game_name} 的最新新闻。"
+
+    async def _handle_me_status(self, event: AstrMessageEvent) -> str:
+        if not event.get_group_id():
+            return "请在群聊中执行 /steam me。"
+
+        if not self.steam_web_api_key:
+            return "未配置 Steam Web API Key，请先在插件配置中填写。"
+
+        platform = event.get_platform_name() or "unknown"
+        group_id = str(event.get_group_id() or "")
+        sender_id = str(event.get_sender_id() or "")
+
+        async with self._lock:
+            binding = None
+            for item in self._bindings:
+                if not isinstance(item, dict):
+                    continue
+                if (
+                    str(item.get("platform") or "") == platform
+                    and str(item.get("group_id") or "") == group_id
+                    and str(item.get("sender_id") or "") == sender_id
+                ):
+                    binding = dict(item)
+                    break
+
+        if not binding:
+            return "你在本群还没有 Steam 绑定，请先使用 /steam bind 进行绑定。"
+
+        steamid64 = str(binding.get("steamid64") or "").strip()
+        if not steamid64:
+            return "当前绑定数据缺少 steamid64，请先解绑后重新绑定。"
+
+        await self._ensure_http_client()
+
+        player = await self._fetch_player_summary(steamid64)
+        if not player:
+            return "获取你的 Steam 状态失败，请稍后重试。"
+
+        steam_name = str(player.get("personaname") or binding.get("steam_name") or steamid64)
+        avatar_url = str(player.get("avatarfull") or binding.get("avatar_url") or "")
+        state, appid, game_name = self._extract_player_state(player)
+        group_nick = str(binding.get("sender_name") or sender_id or "未知成员")
+
+        avatar = await self._fetch_image_pil(avatar_url)
+        cover = None
+        playtime_text = ""
+        status_desc = f"当前状态：{self._state_text(state)}"
+
+        if state == "in_game" and appid > 0:
+            status_desc = f"正在游戏：{game_name}"
+            cover = await self._fetch_cover_image(appid)
+            playtime_text = await self._fetch_playtime_text(steamid64=steamid64, appid=appid)
+        elif state in {"online", "offline"}:
+            cover = await self._fetch_online_offline_cover()
+
+        entries = [
+            {
+                "display_name": f"{steam_name}({group_nick})",
+                "status_desc": status_desc,
+                "game_name": game_name,
+                "playtime_text": playtime_text,
+                "comment_text": "",
+                "avatar": avatar,
+                "cover": cover,
+                "new_state": state,
+            }
+        ]
+
+        card = await self._render_batch_status_card(entries)
+        if not card:
+            return "状态图生成失败，请稍后重试。"
+
+        await self.context.send_message(event.unified_msg_origin, MessageChain().file_image(card))
+        return "已发送你的 Steam 状态图。"
 
     async def _handle_list_status(self, event: AstrMessageEvent) -> str:
         if not event.get_group_id():
