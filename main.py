@@ -213,12 +213,14 @@ class SteamWatch(Star):
     async def _handle_bind(self, event: AstrMessageEvent, raw_target: str) -> str:
         if not event.get_group_id():
             return "请在群聊中执行绑定，才能将 Steam 状态推送到对应群。"
-        if not raw_target:
+        precise_payload = self._extract_bind_payload_precise(event)
+        bind_payload = precise_payload if precise_payload else str(raw_target or "").strip()
+        if not bind_payload:
             return "用法：/steam 绑定 [好友码/64位id/好友链接/资料链接] [可选:qq]"
         if not self.steam_web_api_key:
             return "未配置 Steam Web API Key，请先在插件配置中填写。"
 
-        steam_target, qq_target = self._parse_bind_args(raw_target)
+        steam_target, qq_target = self._parse_bind_args(bind_payload)
         if not steam_target:
             return "用法：/steam 绑定 [好友码/64位id/好友链接/资料链接] [可选:qq]"
 
@@ -336,7 +338,7 @@ class SteamWatch(Star):
 
     @staticmethod
     def _parse_bind_args(raw_target: str) -> tuple[str, str]:
-        text = str(raw_target or "").strip()
+        text = SteamWatch._sanitize_bind_payload(raw_target)
         if not text:
             return "", ""
         parts = text.split(maxsplit=1)
@@ -347,6 +349,33 @@ class SteamWatch(Star):
         if not steam_target or not qq_target or " " in qq_target:
             return "", ""
         return steam_target, qq_target
+
+    @staticmethod
+    def _sanitize_bind_payload(raw_target: str) -> str:
+        text = str(raw_target or "").strip()
+        if not text:
+            return ""
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if lines:
+            text = lines[0]
+        text = re.sub(r"\[CQ:[^\]]+\]", " ", text, flags=re.IGNORECASE)
+        text = re.sub(r"<@!?\d+>", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+
+    def _extract_bind_payload_precise(self, event: AstrMessageEvent) -> str:
+        msg = (event.get_message_str() or "").strip()
+        if not msg:
+            return ""
+        patterns = [
+            r"^\s*/?steam\s+bind\s+(.+?)\s*$",
+            r"^\s*/?steam\s+绑定\s+(.+?)\s*$",
+        ]
+        for pat in patterns:
+            m = re.match(pat, msg, flags=re.IGNORECASE)
+            if m:
+                return self._sanitize_bind_payload(m.group(1) or "")
+        return ""
 
     async def _handle_unbind(self, event: AstrMessageEvent) -> str:
         if not event.get_group_id():
