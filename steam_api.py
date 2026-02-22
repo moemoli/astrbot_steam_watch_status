@@ -5,6 +5,7 @@ import io
 import re
 
 import aiohttp
+
 from astrbot.api import logger
 
 try:
@@ -369,6 +370,59 @@ class SteamApi:
             img = await self.fetch_image_pil(url)
             if img is not None:
                 return img
+        return None
+
+    async def fetch_grid_image_by_id(self, grid_id: int):
+        if grid_id <= 0:
+            return None
+
+        http = self._http()
+        if not http or not self.steamgriddb_api_key:
+            return None
+
+        headers = {"Authorization": f"Bearer {self.steamgriddb_api_key}"}
+        candidate_apis = [
+            f"https://www.steamgriddb.com/api/v2/grids/{grid_id}",
+            f"https://www.steamgriddb.com/api/v2/grids/id/{grid_id}",
+        ]
+
+        for api in candidate_apis:
+            try:
+                async with http.get(api, headers=headers) as resp:
+                    if resp.status != 200:
+                        continue
+                    payload = await resp.json(content_type=None)
+
+                data = (payload or {}).get("data")
+                candidate_urls: list[str] = []
+
+                if isinstance(data, dict):
+                    url = str(data.get("url") or "").strip()
+                    thumb = str(data.get("thumb") or "").strip()
+                    if url:
+                        candidate_urls.append(url)
+                    if thumb:
+                        candidate_urls.append(thumb)
+                elif isinstance(data, list):
+                    for item in data:
+                        if not isinstance(item, dict):
+                            continue
+                        url = str(item.get("url") or "").strip()
+                        thumb = str(item.get("thumb") or "").strip()
+                        if url:
+                            candidate_urls.append(url)
+                        if thumb:
+                            candidate_urls.append(thumb)
+                        if candidate_urls:
+                            break
+
+                for url in candidate_urls:
+                    img = await self.fetch_image_pil(url)
+                    if img is not None:
+                        return img
+            except Exception as exc:
+                logger.debug(f"steamgriddb grid fetch failed (grid_id={grid_id}): {exc!s}")
+
         return None
 
     async def fetch_image_pil(self, url: str):

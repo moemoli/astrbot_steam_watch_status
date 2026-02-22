@@ -25,6 +25,7 @@ from .steam_store import SteamStateStore
 @register("astrbot_steam_watch_status", "moemoli", "Steam 状态监控插件", "0.0.1")
 class SteamWatch(Star):
     _global_poll_task: asyncio.Task | None = None
+    _online_offline_grid_id = 148182
     _default_llm_comment_prompt = (
         "你是游戏群里的简短播报助手。"
         "玩家 {display_name} 刚结束《{game_name}》；{duration_text}。"
@@ -276,6 +277,12 @@ class SteamWatch(Star):
         msg = await self._handle_subscribe_test(event, str(game or "").strip())
         yield event.plain_result(msg)
 
+    @steam.command("列表", alias={"list", "ls"})
+    async def list_status(self, event: AstrMessageEvent):
+        msg = await self._handle_list_status(event)
+        if msg:
+            yield event.plain_result(msg)
+
     @steam.command("自检", alias={"check", "diag"})
     async def self_check(self, event: AstrMessageEvent):
         msg = self._handle_self_check()
@@ -505,6 +512,86 @@ class SteamWatch(Star):
         await self.context.send_message(event.unified_msg_origin, chain)
 
         return f"测试完成：已拉取并推送 {game_name} 的最新新闻。"
+
+    async def _handle_list_status(self, event: AstrMessageEvent) -> str:
+        if not event.get_group_id():
+            return "请在群聊中执行 /steam list。"
+
+        if not self.steam_web_api_key:
+            return "未配置 Steam Web API Key，请先在插件配置中填写。"
+
+        platform = event.get_platform_name() or "unknown"
+        group_id = str(event.get_group_id() or "")
+
+        async with self._lock:
+            bindings = [
+                dict(x)
+                for x in self._bindings
+                if isinstance(x, dict)
+                and str(x.get("platform") or "") == platform
+                and str(x.get("group_id") or "") == group_id
+            ]
+
+        if not bindings:
+            return "当前群还没有绑定任何 Steam 账号。"
+
+        await self._ensure_http_client()
+
+        ids = [str(b.get("steamid64") or "").strip() for b in bindings]
+        ids = [sid for sid in ids if sid]
+        if not ids:
+            return "当前群绑定数据无有效 SteamID64。"
+
+        players = await self._fetch_player_summaries(ids)
+        online_offline_cover = await self._fetch_online_offline_cover()
+
+        entries: list[dict] = []
+        for b in bindings:
+            steamid64 = str(b.get("steamid64") or "").strip()
+            if not steamid64:
+                continue
+
+            player = players.get(steamid64) or {}
+            steam_name = str(player.get("personaname") or b.get("steam_name") or steamid64)
+            avatar_url = str(player.get("avatarfull") or b.get("avatar_url") or "")
+            state, appid, game_name = self._extract_player_state(player)
+            group_nick = str(b.get("sender_name") or b.get("sender_id") or "未知成员")
+            display_name = f"{steam_name}({group_nick})"
+
+            avatar = await self._fetch_image_pil(avatar_url)
+            cover = None
+            playtime_text = ""
+            status_desc = f"当前状态：{self._state_text(state)}"
+
+            if state == "in_game" and appid > 0:
+                status_desc = f"正在游戏：{game_name}"
+                cover = await self._fetch_cover_image(appid)
+                playtime_text = await self._fetch_playtime_text(steamid64=steamid64, appid=appid)
+            elif state in {"online", "offline"}:
+                cover = online_offline_cover
+
+            entries.append(
+                {
+                    "display_name": display_name,
+                    "status_desc": status_desc,
+                    "game_name": game_name,
+                    "playtime_text": playtime_text,
+                    "comment_text": "",
+                    "avatar": avatar,
+                    "cover": cover,
+                    "new_state": state,
+                }
+            )
+
+        if not entries:
+            return "当前群没有可展示的绑定状态。"
+
+        card = await self._render_batch_status_card(entries)
+        if not card:
+            return "状态图生成失败，请稍后重试。"
+
+        await self.context.send_message(event.unified_msg_origin, MessageChain().file_image(card))
+        return "已发送当前群 Steam 绑定状态图。"
 
     async def _ensure_http_client(self) -> None:
         if self._http and not self._http.closed:
@@ -971,6 +1058,8 @@ class SteamWatch(Star):
             status_desc = (
                 f"{self._state_text(old_state)} -> {self._state_text(new_state)}"
             )
+            if new_state in {"online", "offline"}:
+                cover = await self._fetch_online_offline_cover()
 
         if network_jitter:
             status_desc = "网络波动"
@@ -1192,6 +1281,9 @@ class SteamWatch(Star):
 
     async def _fetch_cover_image(self, appid: int):
         return await self._api.fetch_cover_image(appid)
+
+    async def _fetch_online_offline_cover(self):
+        return await self._api.fetch_grid_image_by_id(self._online_offline_grid_id)
 
     async def _fetch_image_pil(self, url: str):
         return await self._api.fetch_image_pil(url)
