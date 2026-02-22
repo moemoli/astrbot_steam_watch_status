@@ -218,14 +218,9 @@ class SteamWatch(Star):
         if not self.steam_web_api_key:
             return "未配置 Steam Web API Key，请先在插件配置中填写。"
 
-        raw_parts = [x for x in str(raw_target).split() if x]
-        if not raw_parts:
+        steam_target, qq_target = self._parse_bind_args(raw_target)
+        if not steam_target:
             return "用法：/steam 绑定 [好友码/64位id/好友链接/资料链接] [可选:qq]"
-        if len(raw_parts) > 2:
-            return "参数过多。用法：/steam 绑定 [好友码/64位id/好友链接/资料链接] [可选:qq]"
-
-        steam_target = raw_parts[0].strip()
-        qq_target = raw_parts[1].strip() if len(raw_parts) == 2 else ""
 
         platform = event.get_platform_name() or "unknown"
         platform_id = event.get_platform_id() or ""
@@ -336,6 +331,24 @@ class SteamWatch(Star):
         if state == "in_game" and appid:
             msg += f"（{game_name}）"
         return msg
+
+    @staticmethod
+    def _parse_bind_args(raw_target: str) -> tuple[str, str]:
+        text = str(raw_target or "").strip()
+        if not text:
+            return "", ""
+        parts = [x for x in text.split() if x]
+        if not parts:
+            return "", ""
+        if len(parts) == 1:
+            return parts[0].strip(), ""
+
+        last = parts[-1].strip()
+        if re.fullmatch(r"\d{5,12}", last):
+            steam_target = " ".join(parts[:-1]).strip()
+            return steam_target, last
+
+        return " ".join(parts).strip(), ""
 
     async def _handle_unbind(self, event: AstrMessageEvent) -> str:
         if not event.get_group_id():
