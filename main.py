@@ -12,7 +12,6 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.provider import Provider
 from astrbot.api.star import Context, Star, register
-from astrbot.core.star.filter.command import GreedyStr
 from astrbot.core.utils.astrbot_path import (
     get_astrbot_plugin_data_path,
     get_astrbot_temp_path,
@@ -131,24 +130,39 @@ class SteamWatch(Star):
         self, event: AstrMessageEvent, steam: str | None = None, qq: str | None = None
     ):
         if not event.get_group_id():
-             yield event.plain_result("请在群聊中执行绑定，状态变化会推送到该群。")
+            yield event.plain_result("请在群聊中执行绑定，状态变化会推送到该群。")
+            return
 
         if not self.steam_web_api_key:
             yield event.plain_result("未配置 Steam Web API Key，请先在插件配置中填写。")
+            return
 
         if not steam:
             yield event.plain_result(self._steam_help_text())
+            return
 
-        sender_id = str(qq or event.get_sender_id()).strip()
+        sender_id = str(event.get_sender_id() or "").strip()
+        qq_target = str(qq or "").strip()
+        if qq_target and qq_target == sender_id and qq_target != str(steam).strip():
+            qq_target = ""
 
-        bind_sender_id = sender_id
+        if qq_target:
+            qq_match = re.fullmatch(
+                r"(?:qq[:=])?(\d{5,12})", qq_target, flags=re.IGNORECASE
+            )
+            if not qq_match:
+                yield event.plain_result("绑定失败：QQ 参数格式错误，请输入纯数字 QQ 号。")
+                return
+            qq_target = qq_match.group(1)
+
+        bind_sender_id = qq_target or sender_id
         if not bind_sender_id:
             yield event.plain_result("绑定失败：无法识别发送者 QQ。")
             return
 
         await self._ensure_http_client()
 
-        steamid64 = await self._resolve_steamid64(str(steam))
+        steamid64 = await self._resolve_steamid64(str(steam).strip())
         if not steamid64:
             yield event.plain_result("绑定失败：无法识别该 Steam 标识。")
             return
@@ -162,8 +176,8 @@ class SteamWatch(Star):
         group_id = str(event.get_group_id() or "")
         session = str(event.unified_msg_origin or "")
         sender_name = str(event.get_sender_name() or "").strip()
-        if qq and qq != sender_id:
-            sender_name = sender_name or f"QQ:{qq}"
+        if qq_target and qq_target != sender_id:
+            sender_name = sender_name or f"QQ:{qq_target}"
 
         now_ts = int(time.time())
 
@@ -231,12 +245,13 @@ class SteamWatch(Star):
 
             await self._save_state_unlocked()
 
-        if qq and qq != sender_id:
+        if qq_target and qq_target != sender_id:
             yield event.plain_result(
                 f"绑定成功：Steam {steam_name} ({steamid64})\n"
-                f"绑定对象：QQ {qq}\n"
+                f"绑定对象：QQ {qq_target}\n"
                 "后续状态变化将推送到当前群。"
             )
+            return
         yield event.plain_result (
             f"绑定成功：Steam {steam_name} ({steamid64})\n后续状态变化将推送到当前群。"
         )
@@ -247,17 +262,17 @@ class SteamWatch(Star):
         yield event.plain_result(msg)
 
     @steam.command("状态测试", alias={"status", "statustest"})
-    async def status_test(self, event: AstrMessageEvent, target: GreedyStr):
+    async def status_test(self, event: AstrMessageEvent, target: str | None = None):
         msg = await self._handle_status_test(event, str(target or "").strip())
         yield event.plain_result(msg)
 
     @steam.command("订阅", alias={"subscribe", "sub"})
-    async def subscribe(self, event: AstrMessageEvent, game: GreedyStr):
+    async def subscribe(self, event: AstrMessageEvent, game: str | None = None):
         msg = await self._handle_subscribe_game(event, str(game or "").strip())
         yield event.plain_result(msg)
 
     @steam.command("订阅测试", alias={"subtest", "testsub"})
-    async def subscribe_test(self, event: AstrMessageEvent, game: GreedyStr):
+    async def subscribe_test(self, event: AstrMessageEvent, game: str | None = None):
         msg = await self._handle_subscribe_test(event, str(game or "").strip())
         yield event.plain_result(msg)
 
@@ -329,20 +344,6 @@ class SteamWatch(Star):
         text = re.sub(r"<@!?\d+>", " ", text)
         text = re.sub(r"\s+", " ", text).strip()
         return text
-
-    def _extract_bind_payload_precise(self, event: AstrMessageEvent) -> str:
-        msg = (event.get_message_str() or "").strip()
-        if not msg:
-            return ""
-        patterns = [
-            r"^\s*/?steam\s+bind\s+(.+?)\s*$",
-            r"^\s*/?steam\s+绑定\s+(.+?)\s*$",
-        ]
-        for pat in patterns:
-            m = re.match(pat, msg, flags=re.IGNORECASE)
-            if m:
-                return self._sanitize_bind_payload(m.group(1) or "")
-        return ""
 
     async def _handle_unbind(self, event: AstrMessageEvent) -> str:
         if not event.get_group_id():
