@@ -5,6 +5,7 @@ import io
 import time
 import uuid
 from pathlib import Path
+from typing import Any
 
 try:
     import cairosvg
@@ -23,7 +24,8 @@ except Exception:  # pragma: no cover
 class SteamRenderer:
     def __init__(self, cards_dir: Path):
         self._cards_dir = cards_dir
-        self._steam_logo_cache: dict[int, object] = {}
+        self._steam_logo_cache: dict[int, Any] = {}
+        self._font_cache: dict[tuple[str, int], Any] = {}
 
     async def render_playing_card(
         self,
@@ -83,7 +85,7 @@ class SteamRenderer:
         count = len(entries)
         width = 900
         header_h = 104
-        row_h = 168
+        row_h = 178
         padding = 22
         height = header_h + row_h * count + padding
 
@@ -154,6 +156,7 @@ class SteamRenderer:
             status_desc = str(it.get("status_desc") or "")
             game_name = str(it.get("game_name") or "")
             playtime = str(it.get("playtime_text") or "")
+            comment_text = str(it.get("comment_text") or "")
 
             status_symbol = self._status_symbol(ns)
             draw.text((236, top + 22), f"{status_symbol} {name}", fill=(245, 245, 245), font=font_name)
@@ -176,6 +179,13 @@ class SteamRenderer:
                 draw.text((236, top + 98), f"游戏：{game_name}", fill=(220, 220, 220), font=font_small)
             if playtime:
                 draw.text((236, top + 126), playtime, fill=(200, 200, 200), font=font_small)
+            if comment_text:
+                draw.text(
+                    (236, top + 150),
+                    f"评价：{self._truncate_text(draw, comment_text, font_small, width - 290)}",
+                    fill=(158, 204, 236),
+                    font=font_small,
+                )
 
         draw.text(
             (width - 250, height - 22),
@@ -311,22 +321,39 @@ class SteamRenderer:
         if ImageFont is None:
             return None
         plugin_fonts = self._cards_dir.parent / "fonts"
-        candidates = [
-            str(plugin_fonts / "NotoSansHans-Regular.otf"),
-            str(plugin_fonts / "NotoSansHans-Medium.otf"),
-            "C:/Windows/Fonts/msyh.ttc",
-            "C:/Windows/Fonts/simhei.ttf",
-            "C:/Windows/Fonts/msyhbd.ttc",
+        candidates: list[str] = []
+
+        preferred = [
+            plugin_fonts / "NotoSansHans-Medium.otf",
+            plugin_fonts / "NotoSansHans-Regular.otf",
         ]
+        for fp in preferred:
+            if fp.exists():
+                candidates.append(str(fp))
+
         if plugin_fonts.exists():
             for ext in ("*.otf", "*.ttf", "*.ttc"):
                 for fp in sorted(plugin_fonts.glob(ext)):
                     p = str(fp)
                     if p not in candidates:
-                        candidates.insert(0, p)
+                        candidates.append(p)
+
+        candidates.extend(
+            [
+                "C:/Windows/Fonts/msyh.ttc",
+                "C:/Windows/Fonts/simhei.ttf",
+                "C:/Windows/Fonts/msyhbd.ttc",
+            ]
+        )
+
         for p in candidates:
+            key = (p, size)
+            if key in self._font_cache:
+                return self._font_cache[key]
             try:
-                return ImageFont.truetype(p, size=size)
+                font = ImageFont.truetype(p, size=size)
+                self._font_cache[key] = font
+                return font
             except Exception:
                 continue
         return ImageFont.load_default()
@@ -357,11 +384,8 @@ class SteamRenderer:
         if logo is not None:
             canvas.paste(logo, (x + 12, y + 12), logo)
         else:
-            cx, cy, r = x + 24, y + 24, 10
-            draw.ellipse([(cx - r, cy - r), (cx + r, cy + r)], fill=(180, 205, 225))
-            draw.ellipse([(cx - 4, cy - 4), (cx + 4, cy + 4)], fill=(34, 51, 74))
-            draw.line([(cx + 7, cy - 7), (cx + 24, cy - 16)], fill=(180, 205, 225), width=3)
-            draw.ellipse([(cx + 20, cy - 20), (cx + 30, cy - 10)], outline=(180, 205, 225), width=2)
+            draw.ellipse([(x + 12, y + 12), (x + 36, y + 36)], fill=(180, 205, 225))
+            draw.text((x + 19, y + 13), "S", fill=(34, 51, 74), font=self._load_font(18))
         draw.text((x + 44, y + 13), "STEAM", fill=(215, 230, 245), font=self._load_font(20))
 
     def _load_steam_logo_icon(self, size: int):
@@ -375,8 +399,9 @@ class SteamRenderer:
             return None
 
         try:
+            svg_data = logo_svg.read_bytes()
             png_bytes = cairosvg.svg2png(
-                url=str(logo_svg),
+                bytestring=svg_data,
                 output_width=size,
                 output_height=size,
             )
@@ -420,6 +445,20 @@ class SteamRenderer:
         d.rounded_rectangle([(8, 8), (w + 2, h + 2)], radius=radius, fill=(0, 0, 0, 110))
         shadow = shadow.filter(ImageFilter.GaussianBlur(5))
         canvas.paste(shadow, (x1 - 8, y1 - 8), shadow)
+
+    @staticmethod
+    def _truncate_text(draw, text: str, font, max_width: int) -> str:
+        if not text:
+            return ""
+        if max_width <= 0:
+            return text
+        curr = text.strip()
+        while curr:
+            box = draw.textbbox((0, 0), curr, font=font)
+            if box[2] - box[0] <= max_width:
+                return curr
+            curr = curr[:-1]
+        return ""
 
     @staticmethod
     def _wrap_text(draw, text: str, font, max_width: int) -> list[str]:

@@ -9,6 +9,7 @@ from pathlib import Path
 import aiohttp
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.provider import Provider
 from astrbot.api.star import Context, Star, register
 from astrbot.core.star.filter.command import GreedyStr
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
@@ -20,12 +21,19 @@ from .steam_store import SteamStateStore
 @register("astrbot_steam_watch_status", "moemoli", "Steam 状态监控插件", "0.0.1")
 class SteamWatch(Star):
     _global_poll_task: asyncio.Task | None = None
+    _default_llm_comment_prompt = (
+        "你是游戏群里的简短播报助手。"
+        "玩家 {display_name} 刚结束《{game_name}》；{duration_text}。"
+        "请给一句 8~24 字中文评价，语气自然，不要 emoji，不要引号。"
+    )
 
     def __init__(self, context: Context, config=None):
         super().__init__(context, config)
         self.config = config or {}
         self.steam_web_api_key = str((self.config or {}).get("steam_web_api_key", "")).strip()
         self.steamgriddb_api_key = str((self.config or {}).get("steamgriddb_api_key", "")).strip()
+        self.llm_provider_id = str((self.config or {}).get("llm_provider_id", "")).strip()
+        self.llm_comment_prompt = str((self.config or {}).get("llm_comment_prompt", "")).strip()
         self.poll_interval_sec = self._parse_poll_interval_sec(
             (self.config or {}).get("poll_interval_sec", "60")
         )
@@ -180,6 +188,7 @@ class SteamWatch(Star):
             "last_state": state,
             "last_appid": appid,
             "last_game_name": game_name,
+            "in_game_since_ts": now if state == "in_game" and appid > 0 else 0,
             "last_change_ts": now,
             "created_ts": now,
         }
@@ -333,6 +342,13 @@ class SteamWatch(Star):
                 new_state == "in_game" and int(new_appid or 0) != int(old_appid or 0)
             )
             if changed:
+                now_ts = int(time.time())
+                old_game_name = str(b.get("last_game_name") or "")
+                old_in_game_since_ts = int(b.get("in_game_since_ts") or b.get("last_change_ts") or now_ts)
+                session_secs = 0
+                if old_state == "in_game" and new_state in {"online", "offline"}:
+                    session_secs = max(0, now_ts - old_in_game_since_ts)
+
                 session = str(b.get("session") or "").strip()
                 if session:
                     changes_by_session.setdefault(session, []).append(
@@ -342,15 +358,22 @@ class SteamWatch(Star):
                             "steamid64": sid,
                             "avatar_url": avatar,
                             "old_state": old_state,
+                            "old_appid": int(old_appid or 0),
+                            "old_game": old_game_name,
                             "new_state": new_state,
                             "new_appid": int(new_appid or 0),
                             "new_game": new_game or (f"App {new_appid}" if new_appid else ""),
+                            "session_secs": session_secs,
                         }
                     )
                 b["last_state"] = new_state
                 b["last_appid"] = new_appid
                 b["last_game_name"] = new_game
-                b["last_change_ts"] = int(time.time())
+                b["last_change_ts"] = now_ts
+                if new_state == "in_game" and new_appid > 0:
+                    b["in_game_since_ts"] = now_ts
+                elif old_state == "in_game" and new_state in {"online", "offline"}:
+                    b["in_game_since_ts"] = 0
 
             updates[bid] = b
 
@@ -451,7 +474,7 @@ class SteamWatch(Star):
             return
 
         enriched_list = await asyncio.gather(
-            *(self._build_change_entry(c) for c in changes),
+            *(self._build_change_entry(c, session=session) for c in changes),
             return_exceptions=True,
         )
 
@@ -469,26 +492,44 @@ class SteamWatch(Star):
             return
         await self.context.send_message(session, MessageChain().file_image(card))
 
-    async def _build_change_entry(self, change: dict) -> dict:
+    async def _build_change_entry(self, change: dict, *, session: str) -> dict:
         steam_name = str(change.get("steam_name") or "未知")
         group_nick = str(change.get("group_nick") or "未知成员")
         display_name = f"{steam_name}({group_nick})"
         old_state = str(change.get("old_state") or "")
         new_state = str(change.get("new_state") or "")
+        old_appid = int(change.get("old_appid") or 0)
+        old_game = str(change.get("old_game") or "")
         appid = int(change.get("new_appid") or 0)
         game_name = str(change.get("new_game") or "")
         steamid64 = str(change.get("steamid64") or "")
         avatar_url = str(change.get("avatar_url") or "")
+        session_secs = int(change.get("session_secs") or 0)
 
         avatar = await self._fetch_image_pil(avatar_url)
         cover = None
         playtime_text = ""
+        comment_text = ""
 
         if new_state == "in_game" and appid > 0:
             playtime_text = await self._fetch_playtime_text(steamid64=steamid64, appid=appid)
             cover = await self._fetch_cover_image(appid)
             status_desc = f"开始游戏：{game_name}"
         elif old_state == "in_game" and new_state in {"online", "offline"}:
+            if old_appid > 0:
+                cover = await self._fetch_cover_image(old_appid)
+            if old_game:
+                game_name = old_game
+            if session_secs > 0:
+                playtime_text = f"本次游戏时长：{self._format_duration(session_secs)}"
+            else:
+                playtime_text = "本次游戏时长：未知"
+            comment_text = await self._generate_llm_comment(
+                session=session,
+                display_name=display_name,
+                game_name=game_name or "该游戏",
+                duration_text=playtime_text,
+            )
             status_desc = f"结束游戏 -> {self._state_text(new_state)}"
         else:
             status_desc = f"{self._state_text(old_state)} -> {self._state_text(new_state)}"
@@ -498,10 +539,81 @@ class SteamWatch(Star):
             "status_desc": status_desc,
             "game_name": game_name,
             "playtime_text": playtime_text,
+            "comment_text": comment_text,
             "avatar": avatar,
             "cover": cover,
             "new_state": new_state,
         }
+
+    async def _generate_llm_comment(
+        self,
+        *,
+        session: str,
+        display_name: str,
+        game_name: str,
+        duration_text: str,
+    ) -> str:
+        if not session:
+            return ""
+        provider = self._resolve_comment_provider(session)
+        if not provider or not isinstance(provider, Provider):
+            return ""
+
+        prompt = self._build_llm_comment_prompt(
+            display_name=display_name,
+            game_name=game_name,
+            duration_text=duration_text,
+        )
+        try:
+            resp = await asyncio.wait_for(provider.text_chat(prompt=prompt), timeout=15)
+            text = (getattr(resp, "completion_text", "") or "").strip()
+            text = re.sub(r"\s+", " ", text)
+            text = text.replace("\n", " ").strip(" \"'“”‘’")
+            if len(text) > 28:
+                text = text[:28].rstrip("，。,.!?！？") + "。"
+            return text
+        except Exception as exc:
+            logger.debug(f"llm comment generate failed: {exc!s}")
+            return ""
+
+    def _resolve_comment_provider(self, session: str):
+        if self.llm_provider_id:
+            try:
+                provider = self.context.get_provider_by_id(self.llm_provider_id)
+                if provider is not None:
+                    return provider
+            except Exception as exc:
+                logger.debug(f"resolve llm provider by id failed: {exc!s}")
+        return self.context.get_using_provider(umo=session)
+
+    def _build_llm_comment_prompt(
+        self,
+        *,
+        display_name: str,
+        game_name: str,
+        duration_text: str,
+    ) -> str:
+        template = self.llm_comment_prompt or self._default_llm_comment_prompt
+        payload = {
+            "display_name": display_name,
+            "game_name": game_name,
+            "duration_text": duration_text,
+        }
+        try:
+            return template.format(**payload)
+        except Exception:
+            return self._default_llm_comment_prompt.format(**payload)
+
+    @staticmethod
+    def _format_duration(seconds: int) -> str:
+        total = max(0, int(seconds))
+        hours, rem = divmod(total, 3600)
+        minutes, sec = divmod(rem, 60)
+        if hours > 0:
+            return f"{hours}小时{minutes}分"
+        if minutes > 0:
+            return f"{minutes}分{sec}秒"
+        return f"{sec}秒"
 
     async def _poll_game_news_once(self) -> None:
         async with self._lock:

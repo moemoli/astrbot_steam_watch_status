@@ -16,5 +16,18 @@
         "default": "60",
         "description": "轮询间隔（秒）",
         "hint": "用于状态与资讯轮询间隔，单位秒。建议 >= 30；过小可能触发接口限流。"
+    },
+    "llm_provider_id": {
+        "type": "string",
+        "default": "",
+        "_special": "select_provider",
+        "description": "评价使用的LLM Provider ID（可选）",
+        "hint": "留空时使用当前会话默认 Provider；填写后优先使用该 Provider。"
+    },
+    "llm_comment_prompt": {
+        "type": "text",
+        "default": "你是游戏群里的简短播报助手。玩家 {display_name} 刚结束《{game_name}》；{duration_text}。请给一句 8~24 字中文评价，语气自然，不要 emoji，不要引号。",
+        "description": "游戏结束评价 Prompt 模板",
+        "hint": "可用变量：{display_name} {game_name} {duration_text}。留空将使用内置默认模板。"
     }
 }
