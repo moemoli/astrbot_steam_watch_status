@@ -552,8 +552,6 @@ class SteamWatch(Star):
                 "changed_sessions": 0,
             }
 
-        await self._refresh_group_nicknames_for_bindings(bindings)
-
         ids = []
         for b in bindings:
             sid = str(b.get("steamid64") or "").strip()
@@ -572,6 +570,7 @@ class SteamWatch(Star):
 
         updates: dict[str, dict] = {}
         changes_by_session: dict[str, list[dict]] = {}
+        nickname_cache_by_group: dict[tuple[str, str, str], dict[str, str]] = {}
         for b in bindings:
             bid = str(b.get("id") or "").strip()
             sid = str(b.get("steamid64") or "").strip()
@@ -630,6 +629,12 @@ class SteamWatch(Star):
 
                 session = str(b.get("session") or "").strip()
                 if session:
+                    latest_sender_name = await self._get_binding_latest_sender_name(
+                        binding=b,
+                        nickname_cache_by_group=nickname_cache_by_group,
+                    )
+                    if latest_sender_name:
+                        b["sender_name"] = latest_sender_name
                     changes_by_session.setdefault(session, []).append(
                         {
                             "steam_name": steam_name,
@@ -689,6 +694,12 @@ class SteamWatch(Star):
 
                 session = str(b.get("session") or "").strip()
                 if emit_change and session:
+                    latest_sender_name = await self._get_binding_latest_sender_name(
+                        binding=b,
+                        nickname_cache_by_group=nickname_cache_by_group,
+                    )
+                    if latest_sender_name:
+                        b["sender_name"] = latest_sender_name
                     changes_by_session.setdefault(session, []).append(
                         {
                             "steam_name": steam_name,
@@ -816,6 +827,32 @@ class SteamWatch(Star):
             if name:
                 out[user_id] = name
         return out
+
+    async def _get_binding_latest_sender_name(
+        self,
+        *,
+        binding: dict,
+        nickname_cache_by_group: dict[tuple[str, str, str], dict[str, str]],
+    ) -> str:
+        platform = str(binding.get("platform") or "")
+        platform_id = str(binding.get("platform_id") or "")
+        group_id = str(binding.get("group_id") or "")
+        sender_id = str(binding.get("sender_id") or "")
+        current_name = str(binding.get("sender_name") or "")
+
+        if not group_id or not sender_id:
+            return current_name
+
+        group_key = (platform, platform_id, group_id)
+        if group_key not in nickname_cache_by_group:
+            nickname_cache_by_group[group_key] = await self._fetch_group_nickname_map(
+                platform=platform,
+                platform_id=platform_id,
+                group_id=group_id,
+            )
+
+        latest = str(nickname_cache_by_group.get(group_key, {}).get(sender_id) or "").strip()
+        return latest or current_name
 
     async def _push_group_state_changes(self, session: str, changes: list[dict]) -> None:
         if not session or not changes:
