@@ -264,8 +264,7 @@ class SteamWatch(Star):
 
     @steam.command("状态测试", alias={"status", "statustest"})
     async def status_test(self, event: AstrMessageEvent, target: str | None = None):
-        msg = await self._handle_status_test(event, str(target or "").strip())
-        yield event.plain_result(msg)
+        await self._handle_status_test(event, str(target or "").strip())
 
     @steam.command("订阅", alias={"subscribe", "sub"})
     async def subscribe(self, event: AstrMessageEvent, game: str | None = None):
@@ -274,20 +273,16 @@ class SteamWatch(Star):
 
     @steam.command("订阅测试", alias={"subtest", "testsub"})
     async def subscribe_test(self, event: AstrMessageEvent, game: str | None = None):
-        msg = await self._handle_subscribe_test(event, str(game or "").strip())
-        yield event.plain_result(msg)
+        await self._handle_subscribe_test(event, str(game or "").strip())
 
     @steam.command("列表", alias={"list", "ls"})
     async def list_status(self, event: AstrMessageEvent):
-        msg = await self._handle_list_status(event)
-        if msg:
-            yield event.plain_result(msg)
+        await self._handle_list_status(event)
 
     @steam.command("我", alias={"me", "my"})
     async def me_status(self, event: AstrMessageEvent):
-        msg = await self._handle_me_status(event)
-        if msg:
-            yield event.plain_result(msg)
+        await self._handle_me_status(event)
+
 
     @steam.command("自检", alias={"check", "diag"})
     async def self_check(self, event: AstrMessageEvent):
