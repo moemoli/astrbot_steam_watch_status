@@ -26,25 +26,25 @@ class SteamApi:
         return self.http
 
     async def resolve_steamid64(self, raw: str) -> str | None:
-        text = (raw or "").strip()
+        text = self._normalize_target(raw)
         if not text:
             return None
 
-        m = re.search(r"steamcommunity\.com/profiles/(\d{17})", text, re.IGNORECASE)
+        m = re.search(r"steamcommunity\.com/profiles/(\d{17})(?:/|$)", text, re.IGNORECASE)
         if m:
             return m.group(1)
 
-        m = re.search(r"steamcommunity\.com/id/([^/?#]+)", text, re.IGNORECASE)
+        m = re.search(r"steamcommunity\.com/id/([^/?#]+)(?:/|$)", text, re.IGNORECASE)
         if m:
             return await self._resolve_vanity(m.group(1))
 
-        m = re.search(r"steamcommunity\.com/addfriend/(\d+)", text, re.IGNORECASE)
+        m = re.search(r"steamcommunity\.com/addfriend/(\d+)(?:/|$)", text, re.IGNORECASE)
         if m:
             acc = int(m.group(1))
             return str(STEAM_ID64_BASE + acc)
 
         if "s.team/p/" in text.lower():
-            from_link = await self._resolve_short_link_to_steamid(text)
+            from_link = await self._resolve_s_team_link(text)
             if from_link:
                 return from_link
 
@@ -59,6 +59,14 @@ class SteamApi:
 
         return await self._resolve_vanity(text)
 
+    @staticmethod
+    def _normalize_target(raw: str | None) -> str:
+        text = (raw or "").strip()
+        text = text.strip("\"'")
+        text = text.strip("<>")
+        text = text.strip()
+        return text
+
     async def _resolve_short_link_to_steamid(self, url: str) -> str | None:
         http = self._http()
         if not http:
@@ -66,15 +74,60 @@ class SteamApi:
         try:
             async with http.get(url, allow_redirects=True) as resp:
                 final_url = str(resp.url)
-            m = re.search(r"steamcommunity\.com/profiles/(\d{17})", final_url, re.IGNORECASE)
-            if m:
-                return m.group(1)
-            m = re.search(r"steamcommunity\.com/id/([^/?#]+)", final_url, re.IGNORECASE)
-            if m:
-                return await self._resolve_vanity(m.group(1))
-            return None
+                page_text = await resp.text(errors="ignore")
+
+            from_final = await self._resolve_steamid_from_any_url(final_url)
+            if from_final:
+                return from_final
+
+            return await self._extract_steamid_from_text(page_text)
         except Exception:
             return None
+
+    async def _resolve_s_team_link(self, url: str) -> str | None:
+        u = self._normalize_target(url)
+        out = await self._resolve_short_link_to_steamid(u)
+        if out:
+            return out
+
+        m = re.search(r"(https?://s\.team/p/[A-Za-z0-9\-]+)", u, re.IGNORECASE)
+        if m:
+            out = await self._resolve_short_link_to_steamid(m.group(1))
+            if out:
+                return out
+        return None
+
+    async def _resolve_steamid_from_any_url(self, url: str) -> str | None:
+        if not url:
+            return None
+        m = re.search(r"steamcommunity\.com/profiles/(\d{17})(?:/|$)", url, re.IGNORECASE)
+        if m:
+            return m.group(1)
+
+        m = re.search(r"steamcommunity\.com/addfriend/(\d+)(?:/|$)", url, re.IGNORECASE)
+        if m:
+            return str(STEAM_ID64_BASE + int(m.group(1)))
+
+        m = re.search(r"steamcommunity\.com/id/([^/?#]+)(?:/|$)", url, re.IGNORECASE)
+        if m:
+            return await self._resolve_vanity(m.group(1))
+        return None
+
+    async def _extract_steamid_from_text(self, text: str) -> str | None:
+        if not text:
+            return None
+        m = re.search(r"steamcommunity\.com/profiles/(\d{17})", text, re.IGNORECASE)
+        if m:
+            return m.group(1)
+
+        m = re.search(r"steamcommunity\.com/addfriend/(\d+)", text, re.IGNORECASE)
+        if m:
+            return str(STEAM_ID64_BASE + int(m.group(1)))
+
+        m = re.search(r"steamcommunity\.com/id/([^/?#\"'\s]+)", text, re.IGNORECASE)
+        if m:
+            return await self._resolve_vanity(m.group(1))
+        return None
 
     async def _resolve_vanity(self, vanity: str) -> str | None:
         http = self._http()
