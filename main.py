@@ -244,29 +244,32 @@ class SteamWatch(Star):
             target_sender_id = qq_target
             target_sender_name = nickname_map.get(qq_target) or target_sender_name
 
-        async with self._lock:
-            for old in self._bindings:
-                if not isinstance(old, dict):
-                    continue
-                if (
-                    str(old.get("platform") or "") == platform
-                    and str(old.get("group_id") or "") == str(group_id)
-                    and str(old.get("sender_id") or "") == str(target_sender_id)
-                ):
-                    bound_name = str(old.get("steam_name") or old.get("steamid64") or "")
-                    if bound_name:
-                        if qq_target:
-                            return f"该成员已经绑定过了（{bound_name}）。"
-                        return f"你已经绑定过了（{bound_name}）。"
-                    if qq_target:
-                        return "该成员已经绑定过了。"
-                    return "你已经绑定过了。"
-
         await self._ensure_http_client()
 
         steamid64 = await self._resolve_steamid64(steam_target)
         if not steamid64:
             return "无法识别该 Steam 标识，请检查输入。"
+
+        async with self._lock:
+            for old in self._bindings:
+                if not isinstance(old, dict):
+                    continue
+                if (
+                    str(old.get("platform") or "") != platform
+                    or str(old.get("group_id") or "") != str(group_id)
+                    or str(old.get("steamid64") or "") != steamid64
+                ):
+                    continue
+
+                old_sender_id = str(old.get("sender_id") or "")
+                if old_sender_id == str(target_sender_id):
+                    bound_name = str(old.get("steam_name") or steamid64)
+                    if qq_target:
+                        return f"该成员已经绑定过该 Steam 账号（{bound_name}）。"
+                    return f"你已经绑定过该 Steam 账号（{bound_name}）。"
+
+                holder_name = str(old.get("sender_name") or old_sender_id)
+                return f"该 Steam 账号已被群成员 {holder_name}({old_sender_id}) 绑定。"
 
         player = await self._fetch_player_summary(steamid64)
         if not player:
@@ -301,6 +304,26 @@ class SteamWatch(Star):
         }
 
         async with self._lock:
+            for old in self._bindings:
+                if not isinstance(old, dict):
+                    continue
+                if (
+                    str(old.get("platform") or "") != platform
+                    or str(old.get("group_id") or "") != str(group_id)
+                    or str(old.get("steamid64") or "") != steamid64
+                ):
+                    continue
+
+                old_sender_id = str(old.get("sender_id") or "")
+                if old_sender_id == str(target_sender_id):
+                    bound_name = str(old.get("steam_name") or steamid64)
+                    if qq_target:
+                        return f"该成员已经绑定过该 Steam 账号（{bound_name}）。"
+                    return f"你已经绑定过该 Steam 账号（{bound_name}）。"
+
+                holder_name = str(old.get("sender_name") or old_sender_id)
+                return f"该 Steam 账号已被群成员 {holder_name}({old_sender_id}) 绑定。"
+
             self._bindings.append(record)
             await self._save_state_unlocked()
 
