@@ -567,6 +567,18 @@ class SteamWatch(Star):
             b["steam_name"] = steam_name
             b["avatar_url"] = avatar
 
+            recent_states = b.get("recent_states")
+            if not isinstance(recent_states, list):
+                recent_states = []
+            recent_states = [str(x) for x in recent_states if x]
+            recent_states.append(new_state)
+            if len(recent_states) > 3:
+                recent_states = recent_states[-3:]
+            b["recent_states"] = recent_states
+            pending_endgame = b.get("pending_endgame")
+            if not isinstance(pending_endgame, dict):
+                pending_endgame = None
+
             if not old_state:
                 b["last_state"] = new_state
                 b["last_appid"] = new_appid
@@ -578,13 +590,18 @@ class SteamWatch(Star):
             changed = new_state != old_state or (
                 new_state == "in_game" and int(new_appid or 0) != int(old_appid or 0)
             )
-            if changed:
+
+            if (
+                pending_endgame
+                and not changed
+                and old_state in {"online", "offline"}
+                and new_state == old_state
+            ):
                 now_ts = int(time.time())
-                old_game_name = str(b.get("last_game_name") or "")
-                old_in_game_since_ts = int(b.get("in_game_since_ts") or b.get("last_change_ts") or now_ts)
-                session_secs = 0
-                if old_state == "in_game" and new_state in {"online", "offline"}:
-                    session_secs = max(0, now_ts - old_in_game_since_ts)
+                pending_start_ts = int(pending_endgame.get("start_ts") or b.get("last_change_ts") or now_ts)
+                pending_old_appid = int(pending_endgame.get("old_appid") or old_appid)
+                pending_old_game = str(pending_endgame.get("old_game") or b.get("last_game_name") or "")
+                session_secs = max(0, now_ts - pending_start_ts)
 
                 session = str(b.get("session") or "").strip()
                 if session:
@@ -594,13 +611,73 @@ class SteamWatch(Star):
                             "group_nick": str(b.get("sender_name") or "未知成员"),
                             "steamid64": sid,
                             "avatar_url": avatar,
-                            "old_state": old_state,
-                            "old_appid": int(old_appid or 0),
-                            "old_game": old_game_name,
+                            "old_state": "in_game",
+                            "old_appid": pending_old_appid,
+                            "old_game": pending_old_game,
                             "new_state": new_state,
                             "new_appid": int(new_appid or 0),
                             "new_game": new_game or (f"App {new_appid}" if new_appid else ""),
                             "session_secs": session_secs,
+                            "network_jitter": False,
+                        }
+                    )
+
+                b["pending_endgame"] = None
+                b["in_game_since_ts"] = 0
+                b["last_change_ts"] = now_ts
+                updates[bid] = b
+                continue
+
+            if changed:
+                now_ts = int(time.time())
+                old_game_name = str(b.get("last_game_name") or "")
+                old_in_game_since_ts = int(b.get("in_game_since_ts") or b.get("last_change_ts") or now_ts)
+                session_secs = 0
+                is_network_jitter = False
+                emit_change = True
+                change_old_state = old_state
+                change_old_appid = int(old_appid or 0)
+                change_old_game = old_game_name
+
+                if old_state == "in_game" and new_state in {"online", "offline"}:
+                    b["pending_endgame"] = {
+                        "old_appid": int(old_appid or 0),
+                        "old_game": old_game_name,
+                        "start_ts": old_in_game_since_ts,
+                        "pending_state": new_state,
+                    }
+                    emit_change = False
+                elif pending_endgame and new_state == "in_game":
+                    pending_state = str(pending_endgame.get("pending_state") or "")
+                    is_network_jitter = pending_state in {"online", "offline"}
+                    change_old_state = pending_state or old_state
+                    change_old_appid = int(pending_endgame.get("old_appid") or old_appid)
+                    change_old_game = str(pending_endgame.get("old_game") or old_game_name)
+                    b["pending_endgame"] = None
+                elif pending_endgame and old_state in {"online", "offline"} and new_state in {"online", "offline"}:
+                    pending_start_ts = int(pending_endgame.get("start_ts") or b.get("last_change_ts") or now_ts)
+                    change_old_state = "in_game"
+                    change_old_appid = int(pending_endgame.get("old_appid") or old_appid)
+                    change_old_game = str(pending_endgame.get("old_game") or old_game_name)
+                    session_secs = max(0, now_ts - pending_start_ts)
+                    b["pending_endgame"] = None
+
+                session = str(b.get("session") or "").strip()
+                if emit_change and session:
+                    changes_by_session.setdefault(session, []).append(
+                        {
+                            "steam_name": steam_name,
+                            "group_nick": str(b.get("sender_name") or "未知成员"),
+                            "steamid64": sid,
+                            "avatar_url": avatar,
+                            "old_state": change_old_state,
+                            "old_appid": change_old_appid,
+                            "old_game": change_old_game,
+                            "new_state": new_state,
+                            "new_appid": int(new_appid or 0),
+                            "new_game": new_game or (f"App {new_appid}" if new_appid else ""),
+                            "session_secs": session_secs,
+                            "network_jitter": is_network_jitter,
                         }
                     )
                 b["last_state"] = new_state
@@ -609,7 +686,7 @@ class SteamWatch(Star):
                 b["last_change_ts"] = now_ts
                 if new_state == "in_game" and new_appid > 0:
                     b["in_game_since_ts"] = now_ts
-                elif old_state == "in_game" and new_state in {"online", "offline"}:
+                elif emit_change and change_old_state == "in_game" and new_state in {"online", "offline"}:
                     b["in_game_since_ts"] = 0
 
             updates[bid] = b
@@ -751,6 +828,7 @@ class SteamWatch(Star):
         steamid64 = str(change.get("steamid64") or "")
         avatar_url = str(change.get("avatar_url") or "")
         session_secs = int(change.get("session_secs") or 0)
+        network_jitter = bool(change.get("network_jitter"))
 
         avatar = await self._fetch_image_pil(avatar_url)
         cover = None
@@ -779,6 +857,9 @@ class SteamWatch(Star):
             status_desc = f"结束游戏 -> {self._state_text(new_state)}"
         else:
             status_desc = f"{self._state_text(old_state)} -> {self._state_text(new_state)}"
+
+        if network_jitter:
+            status_desc = "网络波动"
 
         return {
             "display_name": display_name,
