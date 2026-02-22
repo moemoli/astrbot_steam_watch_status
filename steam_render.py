@@ -27,11 +27,32 @@ except Exception:  # pragma: no cover
 class SteamRenderer:
     def __init__(self, cards_dir: Path):
         self._cards_dir = cards_dir
+        self._plugin_src_dir = Path(__file__).resolve().parent
         self._steam_logo_cache: dict[tuple[int, int], Any] = {}
         self._font_cache: dict[tuple[str, int], Any] = {}
         self._selected_font_path: str | None = None
         self._logo_warned = False
         self._font_warned = False
+
+    def _resolve_plugin_fonts_dir(self) -> Path | None:
+        candidates = [
+            self._plugin_src_dir / "fonts",
+            self._cards_dir.parent / "fonts",
+        ]
+        for p in candidates:
+            if p.exists() and p.is_dir():
+                return p
+        return None
+
+    def _resolve_logo_svg_path(self) -> Path | None:
+        candidates = [
+            self._plugin_src_dir / "assets" / "logo_steam.svg",
+            self._cards_dir.parent / "assets" / "logo_steam.svg",
+        ]
+        for p in candidates:
+            if p.exists() and p.is_file():
+                return p
+        return None
 
     def _label(self, zh: str, en: str) -> str:
         return zh if self._selected_font_path else en
@@ -388,18 +409,18 @@ class SteamRenderer:
     def _load_font(self, size: int):
         if ImageFont is None:
             return None
-        plugin_fonts = self._cards_dir.parent / "fonts"
+        plugin_fonts = self._resolve_plugin_fonts_dir()
         if not self._selected_font_path:
             candidates: list[str] = []
             preferred = [
-                plugin_fonts / "NotoSansHans-Medium.otf",
-                plugin_fonts / "NotoSansHans-Regular.otf",
+                (plugin_fonts / "NotoSansHans-Medium.otf") if plugin_fonts else None,
+                (plugin_fonts / "NotoSansHans-Regular.otf") if plugin_fonts else None,
             ]
             for fp in preferred:
-                if fp.exists():
+                if fp and fp.exists():
                     candidates.append(str(fp))
 
-            if plugin_fonts.exists():
+            if plugin_fonts and plugin_fonts.exists():
                 for ext in ("*.otf", "*.ttf", "*.ttc"):
                     for fp in sorted(plugin_fonts.glob(ext)):
                         p = str(fp)
@@ -496,9 +517,10 @@ class SteamRenderer:
             return self._steam_logo_cache[cache_key]
 
         logo_svg = self._cards_dir.parent / "assets" / "logo_steam.svg"
-        if not logo_svg.exists() or cairosvg is None:
+        resolved_logo = self._resolve_logo_svg_path()
+        if not resolved_logo or cairosvg is None:
             if not self._logo_warned:
-                if not logo_svg.exists():
+                if not resolved_logo:
                     logger.warning("[steam-watch] assets/logo_steam.svg not found")
                 if cairosvg is None:
                     logger.warning("[steam-watch] CairoSVG unavailable, cannot render svg logo")
@@ -506,7 +528,7 @@ class SteamRenderer:
             return None
 
         try:
-            svg_data = logo_svg.read_bytes()
+            svg_data = resolved_logo.read_bytes()
             ratio = 355.666 / 89.333
             vb = self._parse_svg_viewbox(svg_data)
             if vb is not None and vb[2] > 0 and vb[3] > 0:
