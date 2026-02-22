@@ -229,6 +229,8 @@ class SteamWatch(Star):
         target_sender_id = str(event.get_sender_id() or "")
         target_sender_name = event.get_sender_name() or "未知昵称"
         if qq_target:
+            if not re.fullmatch(r"\d{5,12}", qq_target):
+                return "QQ 参数格式错误，请输入纯数字 QQ 号。"
             nickname_map = await self._fetch_group_nickname_map(
                 platform=platform,
                 platform_id=platform_id,
@@ -337,14 +339,14 @@ class SteamWatch(Star):
         text = str(raw_target or "").strip()
         if not text:
             return "", ""
-        parts = [x for x in text.split() if x]
-        if not parts:
-            return "", ""
+        parts = text.split(maxsplit=1)
         if len(parts) == 1:
             return parts[0].strip(), ""
-        if len(parts) == 2:
-            return parts[0].strip(), parts[1].strip()
-        return "", ""
+        steam_target = parts[0].strip()
+        qq_target = parts[1].strip()
+        if not steam_target or not qq_target or " " in qq_target:
+            return "", ""
+        return steam_target, qq_target
 
     async def _handle_unbind(self, event: AstrMessageEvent) -> str:
         if not event.get_group_id():
