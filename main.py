@@ -26,6 +26,9 @@ class SteamWatch(Star):
         self.config = config or {}
         self.steam_web_api_key = str((self.config or {}).get("steam_web_api_key", "")).strip()
         self.steamgriddb_api_key = str((self.config or {}).get("steamgriddb_api_key", "")).strip()
+        self.poll_interval_sec = self._parse_poll_interval_sec(
+            (self.config or {}).get("poll_interval_sec", "60")
+        )
         self._store = SteamStateStore(
             Path(get_astrbot_plugin_data_path()) / "astrbot_steam_watch_status"
         )
@@ -266,7 +269,7 @@ class SteamWatch(Star):
                 try:
                     await self._poll_player_status_once()
                     await self._poll_game_news_once()
-                    await asyncio.sleep(60)
+                    await asyncio.sleep(self.poll_interval_sec)
                 except asyncio.CancelledError:
                     return
                 except Exception as exc:
@@ -453,26 +456,18 @@ class SteamWatch(Star):
         )
 
         enriched: list[dict] = []
-        lines: list[str] = []
         for item in enriched_list:
             if isinstance(item, Exception) or not isinstance(item, dict):
                 continue
             enriched.append(item)
-            lines.append(f"- {item.get('display_name', '未知')}：{item.get('status_desc', '')}")
 
         if not enriched:
             return
 
         card = await self._render_batch_status_card(enriched)
-        head = f"[Steam状态] 本轮状态更新 {len(enriched)} 人"
-        body = "\n".join(lines[:8])
-        if len(lines) > 8:
-            body += f"\n...其余 {len(lines) - 8} 人见图片"
-
-        chain = MessageChain().message(f"{head}\n{body}" if body else head)
-        if card:
-            chain.file_image(card)
-        await self.context.send_message(session, chain)
+        if not card:
+            return
+        await self.context.send_message(session, MessageChain().file_image(card))
 
     async def _build_change_entry(self, change: dict) -> dict:
         steam_name = str(change.get("steam_name") or "未知")
@@ -653,3 +648,13 @@ class SteamWatch(Star):
 
     async def _save_state_unlocked(self) -> None:
         await self._store.save_state(self._bindings, self._game_subscriptions)
+
+    @staticmethod
+    def _parse_poll_interval_sec(raw: object) -> int:
+        try:
+            val = int(str(raw).strip())
+        except Exception:
+            val = 60
+        if val < 10:
+            return 10
+        return val
