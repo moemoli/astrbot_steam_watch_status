@@ -549,7 +549,7 @@ class SteamRenderer:
             html_text=html_text,
             width=980,
             prefix="steam_batch",
-            min_height=680,
+            min_height=320,
         )
 
     async def render_news_card(
