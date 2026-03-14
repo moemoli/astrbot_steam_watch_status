@@ -22,7 +22,6 @@ from .steam_render import SteamRenderer
 from .steam_store import SteamStateStore
 
 
-@register("astrbot_steam_watch_status", "moemoli", "Steam 状态监控插件", "0.0.1")
 class SteamWatch(Star):
     _global_poll_task: asyncio.Task | None = None
     _online_offline_grid_id = 148182
@@ -89,10 +88,10 @@ class SteamWatch(Star):
             (self.config or {}).get("poll_interval_sec", "60")
         )
         temp_cards_dir = (
-            Path(get_astrbot_temp_path()) / "astrbot_steam_watch_status" / "cards"
+            Path(get_astrbot_temp_path()) / "astrbot_plugin_steam_watch_status" / "cards"
         )
         self._store = SteamStateStore(
-            Path(get_astrbot_plugin_data_path()) / "astrbot_steam_watch_status",
+            Path(get_astrbot_plugin_data_path()) / "astrbot_plugin_steam_watch_status",
             cards_dir=temp_cards_dir,
         )
         self._api = SteamApi(
