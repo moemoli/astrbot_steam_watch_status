@@ -34,7 +34,9 @@ class SteamStateStore:
             subs if isinstance(subs, list) else [],
         )
 
-    async def save_state(self, bindings: list[dict], game_subscriptions: list[dict]) -> None:
+    async def save_state(
+        self, bindings: list[dict], game_subscriptions: list[dict]
+    ) -> None:
         await asyncio.to_thread(self._write_state_sync, bindings, game_subscriptions)
 
     def _read_state_sync(self) -> dict:
@@ -49,11 +51,15 @@ class SteamStateStore:
         except Exception:
             return {"bindings": [], "game_subscriptions": []}
 
-    def _write_state_sync(self, bindings: list[dict], game_subscriptions: list[dict]) -> None:
+    def _write_state_sync(
+        self, bindings: list[dict], game_subscriptions: list[dict]
+    ) -> None:
         fp = self.state_file()
         fp.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "bindings": bindings,
             "game_subscriptions": game_subscriptions,
         }
-        fp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        fp.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )

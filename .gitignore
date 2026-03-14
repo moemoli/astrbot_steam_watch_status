@@ -2,6 +2,8 @@
 __pycache__/
 *.py[codz]
 *$py.class
+.tmp_cards/
+assets/template_preview/
 
 # C extensions
 *.so

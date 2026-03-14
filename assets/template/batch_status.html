@@ -1,0 +1,169 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <!--
+    模板：batch_status.html
+    作用：
+      渲染群内状态汇总卡片（一次展示多名 Steam 成员）。
+
+    可用顶层变量：
+      - total: int，本次汇总人数。
+      - entries: list[dict]，每个元素包含：
+          * status        (str)  原始状态值，如 in_game / online / offline / ended
+          * state_label   (str)  状态文案，如 游戏中 / 在线 / 离线 / 结束
+          * cover_uri     (str)  封面图 URL/data-uri，缺失时为空
+          * avatar_uri    (str)  头像 URL/data-uri，缺失时为空
+          * steam_name    (str)  Steam 昵称
+          * group_nickname(str)  群昵称/群名片
+          * status_desc   (str)  状态描述文本
+          * game_name     (str)  可选，游戏名
+          * playtime_text (str)  可选，时长文本
+          * comment_text  (str)  可选，评价文本
+      - generated_at: str，渲染时间戳。
+
+    安全改造说明：
+      1) 请保留 Jinja 控制块（for/if 标签）结构。
+      2) CSS 颜色、间距、字体可自由调整。
+      3) 若修改 class 名，请同步修改对应样式选择器。
+  -->
+  <style>
+    /* 基础主题 */
+    :root {
+      color-scheme: dark;
+      font-family: "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: linear-gradient(180deg, #0f172a 0%, #111827 100%);
+      color: #e5e7eb;
+      padding: 24px;
+    }
+    .card {
+      width: 100%;
+      max-width: 960px;
+      margin: 0 auto;
+      background: rgba(15, 23, 42, 0.86);
+      border: 1px solid rgba(148, 163, 184, 0.24);
+      border-radius: 16px;
+      overflow: hidden;
+      box-shadow: 0 16px 40px rgba(0, 0, 0, 0.35);
+    }
+    .header {
+      padding: 20px 24px 16px;
+      border-bottom: 1px solid rgba(148, 163, 184, 0.22);
+      background: linear-gradient(135deg, rgba(30,41,59,0.95), rgba(15,23,42,0.95));
+    }
+    .title {
+      font-size: 28px;
+      line-height: 1.3;
+      font-weight: 700;
+      color: #f8fafc;
+      margin: 0 0 6px;
+      word-break: break-word;
+    }
+    .subtitle {
+      margin: 0;
+      color: #94a3b8;
+      font-size: 16px;
+      line-height: 1.5;
+    }
+    .footer {
+      padding: 12px 24px 18px;
+      color: #64748b;
+      font-size: 12px;
+      text-align: right;
+      border-top: 1px solid rgba(148, 163, 184, 0.18);
+    }
+    /* 批量列表布局 */
+    .rows { padding: 16px; display: grid; gap: 14px; }
+    .row {
+      position: relative;
+      display: grid;
+      grid-template-columns: 8px 112px 1fr 140px;
+      gap: 14px;
+      padding-right: 14px;
+      align-items: center;
+      background: rgba(30, 41, 59, 0.8);
+      border: 1px solid rgba(148, 163, 184, 0.22);
+      border-radius: 14px;
+      overflow: hidden;
+    }
+    .state-bar { align-self: stretch; }
+    .cover { width: 112px; height: 150px; border-radius: 10px; overflow: hidden; margin: 10px 0; }
+    .cover img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .empty { width: 100%; height: 100%; display:flex; align-items:center; justify-content:center; color:#94a3b8; background:#334155; font-size:12px; }
+    .content { padding: 10px 0; }
+    .line1 { color: #f8fafc; font-size: 22px; font-weight: 700; margin-bottom: 6px; word-break: break-word; }
+    .line2 { color: #cbd5e1; font-size: 16px; margin-bottom: 6px; }
+    .line3,.line4,.line5 { color: #94a3b8; font-size: 14px; margin-top: 4px; word-break: break-word; }
+    .right { display:flex; flex-direction:column; align-items:center; gap:12px; }
+    .badge { font-size: 13px; font-weight: 700; border:1px solid; border-radius:999px; padding:4px 10px; background: rgba(15,23,42,0.45); }
+    .avatar { width: 66px; height: 66px; border-radius: 50%; overflow:hidden; border:1px solid rgba(148,163,184,0.3); }
+    .avatar img { width:100%; height:100%; object-fit:cover; display:block; }
+    .empty-avatar { width:100%; height:100%; display:flex; align-items:center; justify-content:center; color:#cbd5e1; background:#475569; font-weight:700; }
+  </style>
+</head>
+<body>
+  <!-- 卡片容器 -->
+  <div class="card">
+    <!-- 头部：人数来自 {{ total }} -->
+    <div class="header">
+      <p class="title">Steam 状态变化汇总 · {{ total }} 人</p>
+      <p class="subtitle">本轮检测到状态变化（开始/结束游戏/在线变化）</p>
+    </div>
+
+    <!--
+      主列表：
+      遍历 entries，每个成员渲染一行。
+      可选字段通过 if 条件控制显示。
+    -->
+    <div class="rows">
+      {% for item in entries %}
+      {% set state_color = '#a5b4fc' %}
+      {% if item.status == 'in_game' %}
+      {% set state_color = '#34d399' %}
+      {% elif item.status == 'online' %}
+      {% set state_color = '#60a5fa' %}
+      {% elif item.status == 'offline' %}
+      {% set state_color = '#94a3b8' %}
+      {% elif item.status == 'ended' %}
+      {% set state_color = '#f59e0b' %}
+      {% endif %}
+      <div class="row">
+        <div class="state-bar" style="background: {{ state_color }}"></div>
+        <div class="cover">
+          {% if item.cover_uri %}
+          <img src="{{ item.cover_uri }}" alt="cover">
+          {% else %}
+          <div class="empty">No Cover</div>
+          {% endif %}
+        </div>
+        <div class="content">
+          <div class="line1">{{ item.steam_name }}</div>
+          <div class="line2">群昵称：{{ item.group_nickname }}</div>
+          <div class="line3">{{ item.status_desc }}</div>
+          {% if item.game_name %}<div class="line4">游戏：{{ item.game_name }}</div>{% endif %}
+          {% if item.playtime_text %}<div class="line5">本次游戏时长: {{ item.playtime_text }}</div>{% endif %}
+          {% if item.comment_text %}<div class="line5">评价：{{ item.comment_text }}</div>{% endif %}
+        </div>
+        <div class="right">
+          <div class="badge" style="color: {{ state_color }}; border-color: {{ state_color }}66">{{ item.state_label }}</div>
+          <div class="avatar">
+            {% if item.avatar_uri %}
+            <img src="{{ item.avatar_uri }}" alt="avatar">
+            {% else %}
+            <div class="empty-avatar">?</div>
+            {% endif %}
+          </div>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+
+    <!-- 底部时间戳 -->
+    <div class="footer">Generated at {{ generated_at }}</div>
+  </div>
+</body>
+</html>

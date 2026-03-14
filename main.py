@@ -26,6 +26,10 @@ from .steam_store import SteamStateStore
 class SteamWatch(Star):
     _global_poll_task: asyncio.Task | None = None
     _online_offline_grid_id = 148182
+    _steam_store_app_link_re = re.compile(
+        r"https?://store\.steampowered\.com/app/(\d+)(?:/[^\s]*)?",
+        flags=re.IGNORECASE,
+    )
     _default_llm_comment_prompt = (
         "你是游戏群里的简短播报助手。"
         "玩家 {display_name} 刚结束《{game_name}》；{duration_text}。"
@@ -97,6 +101,7 @@ class SteamWatch(Star):
             trust_env=True,
         )
         self._api.http = self._http
+        self._renderer.start_runtime_prepare()
         self._stop = False
         self._poll_task = asyncio.create_task(self._poll_loop())
         SteamWatch._global_poll_task = self._poll_task
@@ -152,7 +157,9 @@ class SteamWatch(Star):
                 r"(?:qq[:=])?(\d{5,12})", qq_target, flags=re.IGNORECASE
             )
             if not qq_match:
-                yield event.plain_result("绑定失败：QQ 参数格式错误，请输入纯数字 QQ 号。")
+                yield event.plain_result(
+                    "绑定失败：QQ 参数格式错误，请输入纯数字 QQ 号。"
+                )
                 return
             qq_target = qq_match.group(1)
 
@@ -192,7 +199,9 @@ class SteamWatch(Star):
                     and str(b.get("steamid64") or "") == steamid64
                     and str(b.get("sender_id") or "") != bind_sender_id
                 ):
-                    yield event.plain_result(f"绑定失败：Steam 账号 {steam_name} 已被本群其他成员绑定。")
+                    yield event.plain_result(
+                        f"绑定失败：Steam 账号 {steam_name} 已被本群其他成员绑定。"
+                    )
                     return
 
             existing = None
@@ -253,7 +262,7 @@ class SteamWatch(Star):
                 "后续状态变化将推送到当前群。"
             )
             return
-        yield event.plain_result (
+        yield event.plain_result(
             f"绑定成功：Steam {steam_name} ({steamid64})\n后续状态变化将推送到当前群。"
         )
 
@@ -283,7 +292,6 @@ class SteamWatch(Star):
     async def me_status(self, event: AstrMessageEvent):
         await self._handle_me_status(event)
 
-
     @steam.command("自检", alias={"check", "diag"})
     async def self_check(self, event: AstrMessageEvent):
         msg = self._handle_self_check()
@@ -292,6 +300,64 @@ class SteamWatch(Star):
     @steam.command("帮助", alias={"help", "h"})
     async def help(self, event: AstrMessageEvent):
         yield event.plain_result(self._steam_help_text())
+
+    @filter.regex(r"https?://store\.steampowered\.com/app/\d+")
+    async def group_steam_store_link_preview(self, event: AstrMessageEvent):
+        if not event.get_group_id():
+            return
+        if getattr(event, "is_at_or_wake_command", False):
+            return
+
+        text = str(event.get_message_str() or "")
+        appids = self._extract_steam_store_appids(text)
+        if not appids:
+            return
+
+        await self._ensure_http_client()
+
+        appid = int(appids[0])
+        app = await self._fetch_app_brief(appid)
+        game_name = str((app or {}).get("name") or f"App {appid}")
+        description = str((app or {}).get("short_description") or "").strip()
+        publisher = str((app or {}).get("publishers") or "").strip()
+        release_date = str((app or {}).get("release_date") or "").strip()
+        store_url = str(
+            (app or {}).get("url") or f"https://store.steampowered.com/app/{appid}/"
+        )
+
+        author_text = publisher or "Steam Store"
+        body = description or "点击链接查看完整游戏详情。"
+        if release_date:
+            body = f"发售日期：{release_date}\n{body}"
+
+        card = await self._render_news_card(
+            appid=appid,
+            game_name=game_name,
+            title="Steam 商店页面预览",
+            author=author_text,
+            date_ts=0,
+            contents=body,
+        )
+
+        chain = MessageChain().message(f"[Steam商店] {game_name}\n{store_url}")
+        if card:
+            chain.file_image(card)
+        await self.context.send_message(event.unified_msg_origin, chain)
+
+    @classmethod
+    def _extract_steam_store_appids(cls, text: str) -> list[int]:
+        out: list[int] = []
+        seen: set[int] = set()
+        for m in cls._steam_store_app_link_re.finditer(str(text or "")):
+            raw = str(m.group(1) or "").strip()
+            if not raw.isdigit():
+                continue
+            appid = int(raw)
+            if appid <= 0 or appid in seen:
+                continue
+            seen.add(appid)
+            out.append(appid)
+        return out
 
     @staticmethod
     def _steam_help_text() -> str:
@@ -325,6 +391,7 @@ class SteamWatch(Star):
                 "提示：请确认 fonts 目录字体可读，且 Pillow 含 FreeType 支持。"
             )
         return "\n".join(lines)
+
     @staticmethod
     def _parse_bind_args(raw_target: str) -> tuple[str, str]:
         text = SteamWatch._sanitize_bind_payload(raw_target)
@@ -352,7 +419,9 @@ class SteamWatch(Star):
         text = re.sub(r"\s+", " ", text).strip()
         return text
 
-    async def _handle_unbind(self, event: AstrMessageEvent, target: str | None = None) -> str:
+    async def _handle_unbind(
+        self, event: AstrMessageEvent, target: str | None = None
+    ) -> str:
         if not event.get_group_id():
             return "请在群聊中执行解绑。"
 
@@ -381,7 +450,9 @@ class SteamWatch(Star):
                     self._bindings = [
                         b
                         for b in self._bindings
-                        if not (isinstance(b, dict) and str(b.get("id") or "") == hit_id)
+                        if not (
+                            isinstance(b, dict) and str(b.get("id") or "") == hit_id
+                        )
                     ]
                     await self._save_state_unlocked()
                     steamid64 = str(hit.get("steamid64") or "未知")
@@ -405,15 +476,17 @@ class SteamWatch(Star):
                 self._bindings = [
                     b
                     for b in self._bindings
-                    if not (isinstance(b, dict) and str(b.get("id") or "") in remove_ids)
+                    if not (
+                        isinstance(b, dict) and str(b.get("id") or "") in remove_ids
+                    )
                 ]
                 await self._save_state_unlocked()
                 return f"解绑成功：已移除你在本群的 {len(remove_ids)} 条 Steam 绑定。"
-            
+
             steamid64 = await self._resolve_steamid64(str(target_text).strip())
             if not steamid64:
                 return "绑定失败：无法识别该 Steam 标识。"
-            
+
             chosen = None
             for item in my_bindings:
                 if str(item.get("steamid64") or "").strip() == steamid64:
@@ -605,7 +678,9 @@ class SteamWatch(Star):
         if not player:
             return "获取你的 Steam 状态失败，请稍后重试。"
 
-        steam_name = str(player.get("personaname") or binding.get("steam_name") or steamid64)
+        steam_name = str(
+            player.get("personaname") or binding.get("steam_name") or steamid64
+        )
         avatar_url = str(player.get("avatarfull") or binding.get("avatar_url") or "")
         state, appid, game_name = self._extract_player_state(player)
         group_nick = str(binding.get("sender_name") or sender_id or "未知成员")
@@ -618,13 +693,16 @@ class SteamWatch(Star):
         if state == "in_game" and appid > 0:
             status_desc = f"正在游戏：{game_name}"
             cover = await self._fetch_cover_image(appid)
-            playtime_text = await self._fetch_playtime_text(steamid64=steamid64, appid=appid)
+            playtime_text = await self._fetch_playtime_text(
+                steamid64=steamid64, appid=appid
+            )
         elif state in {"online", "offline"}:
             cover = await self._fetch_online_offline_cover()
 
         entries = [
             {
-                "display_name": f"{steam_name}({group_nick})",
+                "steam_name": steam_name,
+                "group_nickname": group_nick,
                 "status_desc": status_desc,
                 "game_name": game_name,
                 "playtime_text": playtime_text,
@@ -639,7 +717,9 @@ class SteamWatch(Star):
         if not card:
             return "状态图生成失败，请稍后重试。"
 
-        await self.context.send_message(event.unified_msg_origin, MessageChain().file_image(card))
+        await self.context.send_message(
+            event.unified_msg_origin, MessageChain().file_image(card)
+        )
         return "已发送你的 Steam 状态图。"
 
     async def _handle_list_status(self, event: AstrMessageEvent) -> str:
@@ -681,11 +761,12 @@ class SteamWatch(Star):
                 continue
 
             player = players.get(steamid64) or {}
-            steam_name = str(player.get("personaname") or b.get("steam_name") or steamid64)
+            steam_name = str(
+                player.get("personaname") or b.get("steam_name") or steamid64
+            )
             avatar_url = str(player.get("avatarfull") or b.get("avatar_url") or "")
             state, appid, game_name = self._extract_player_state(player)
             group_nick = str(b.get("sender_name") or b.get("sender_id") or "未知成员")
-            display_name = f"{steam_name}({group_nick})"
 
             avatar = await self._fetch_image_pil(avatar_url)
             cover = None
@@ -695,13 +776,16 @@ class SteamWatch(Star):
             if state == "in_game" and appid > 0:
                 status_desc = f"正在游戏：{game_name}"
                 cover = await self._fetch_cover_image(appid)
-                playtime_text = await self._fetch_playtime_text(steamid64=steamid64, appid=appid)
+                playtime_text = await self._fetch_playtime_text(
+                    steamid64=steamid64, appid=appid
+                )
             elif state in {"online", "offline"}:
                 cover = online_offline_cover
 
             entries.append(
                 {
-                    "display_name": display_name,
+                    "steam_name": steam_name,
+                    "group_nickname": group_nick,
                     "status_desc": status_desc,
                     "game_name": game_name,
                     "playtime_text": playtime_text,
@@ -719,7 +803,9 @@ class SteamWatch(Star):
         if not card:
             return "状态图生成失败，请稍后重试。"
 
-        await self.context.send_message(event.unified_msg_origin, MessageChain().file_image(card))
+        await self.context.send_message(
+            event.unified_msg_origin, MessageChain().file_image(card)
+        )
         return "已发送当前群 Steam 绑定状态图。"
 
     async def _ensure_http_client(self) -> None:
@@ -1172,9 +1258,9 @@ class SteamWatch(Star):
             if old_game:
                 game_name = old_game
             if session_secs > 0:
-                playtime_text = f"本次游戏时长：{self._format_duration(session_secs)}"
+                playtime_text = self._format_duration(session_secs)
             else:
-                playtime_text = "本次游戏时长：未知"
+                playtime_text = "未知"
             comment_text = await self._generate_llm_comment(
                 session=session,
                 display_name=display_name,
@@ -1194,7 +1280,8 @@ class SteamWatch(Star):
             status_desc = "网络波动"
 
         return {
-            "display_name": display_name,
+            "steam_name": steam_name,
+            "group_nickname": group_nick,
             "status_desc": status_desc,
             "game_name": game_name,
             "playtime_text": playtime_text,
@@ -1268,11 +1355,7 @@ class SteamWatch(Star):
         total = max(0, int(seconds))
         hours, rem = divmod(total, 3600)
         minutes, sec = divmod(rem, 60)
-        if hours > 0:
-            return f"{hours}小时{minutes}分"
-        if minutes > 0:
-            return f"{minutes}分{sec}秒"
-        return f"{sec}秒"
+        return f"{hours}时{minutes}分{sec}秒"
 
     async def _poll_game_news_once(self) -> dict[str, int]:
         async with self._lock:
@@ -1363,26 +1446,8 @@ class SteamWatch(Star):
     async def _fetch_latest_news(self, appid: int) -> dict | None:
         return await self._api.fetch_latest_news(appid)
 
-    async def _render_playing_card(
-        self,
-        *,
-        steam_name: str,
-        group_name: str,
-        game_name: str,
-        avatar_url: str,
-        appid: int,
-        playtime_text: str,
-    ) -> str | None:
-        cover = await self._fetch_cover_image(appid)
-        avatar = await self._fetch_image_pil(avatar_url)
-        return await self._renderer.render_playing_card(
-            steam_name=steam_name,
-            group_name=group_name,
-            game_name=game_name,
-            playtime_text=playtime_text,
-            cover=cover,
-            avatar=avatar,
-        )
+    async def _fetch_app_brief(self, appid: int) -> dict | None:
+        return await self._api.fetch_app_brief(appid)
 
     async def _render_batch_status_card(self, entries: list[dict]) -> str | None:
         return await self._renderer.render_batch_status_card(entries)

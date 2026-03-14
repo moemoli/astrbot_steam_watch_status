@@ -1,106 +1,556 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import html
 import io
-import re
+import mimetypes
+import os
+import shutil
+import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+from markupsafe import Markup
 
 from astrbot.api import logger
+from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
+
+if TYPE_CHECKING:
+    from jinja2 import Environment as JinjaEnvironment
+else:
+    JinjaEnvironment = Any
 
 try:
-    import cairosvg
-except Exception:  # pragma: no cover
-    cairosvg = None
-
-try:
-    from PIL import Image, ImageDraw, ImageFilter, ImageFont
+    from PIL import Image
 except Exception:  # pragma: no cover
     Image = None
-    ImageDraw = None
-    ImageFilter = None
-    ImageFont = None
+
+try:
+    from jinja2 import Environment, FileSystemLoader, select_autoescape
+except Exception:  # pragma: no cover
+    Environment = None
+    FileSystemLoader = None
+    select_autoescape = None
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = str(os.environ.get(name) or "").strip()
+    if not raw:
+        return int(default)
+    try:
+        return int(raw)
+    except Exception:
+        return int(default)
+
+
+_HTML_RENDER_LAUNCH_TIMEOUT_SEC = max(
+    2, _env_int("STEAM_HTML_RENDER_LAUNCH_TIMEOUT", 8)
+)
+_HTML_RENDER_PAGE_TIMEOUT_SEC = max(2, _env_int("STEAM_HTML_RENDER_PAGE_TIMEOUT", 8))
+_PLAYWRIGHT_INSTALL_TIMEOUT_SEC = max(
+    60, _env_int("STEAM_PLAYWRIGHT_INSTALL_TIMEOUT", 600)
+)
+
+_PLAYWRIGHT_INSTALL_LOCK = asyncio.Lock()
+_PLAYWRIGHT_INSTALL_DONE = False
+_PLAYWRIGHT_PREPARE_TASK: asyncio.Task[Any] | None = None
+_JINJA_ENV: JinjaEnvironment | None = None
+
+
+class _PlaywrightRuntime:
+    def __init__(self) -> None:
+        self._playwright = None
+        self._lock = asyncio.Lock()
+
+    async def get(self):
+        async with self._lock:
+            if self._playwright is not None:
+                return self._playwright
+            try:
+                from playwright.async_api import async_playwright
+            except Exception as exc:
+                logger.warning(f"playwright import failed: {exc!s}")
+                return None
+
+            try:
+                self._playwright = await async_playwright().start()
+                return self._playwright
+            except Exception as exc:
+                logger.warning(f"playwright startup failed: {exc!s}")
+                return None
+
+
+_PLAYWRIGHT_RUNTIME = _PlaywrightRuntime()
+
+
+async def _run_playwright_cli(args: list[str], *, timeout_sec: int) -> tuple[int, str]:
+    cmd = [sys.executable, "-m", "playwright", *args]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+    except Exception as exc:
+        return 1, f"spawn failed: {exc!s}"
+
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=float(timeout_sec))
+    except TimeoutError:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return 124, "timeout"
+    except Exception as exc:
+        return 1, f"run failed: {exc!s}"
+
+    text = (out or b"").decode("utf-8", errors="ignore").strip()
+    return int(proc.returncode or 0), text
+
+
+async def ensure_playwright_runtime_ready(*, browser: str = "chromium") -> None:
+    global _PLAYWRIGHT_INSTALL_DONE
+
+    if _PLAYWRIGHT_INSTALL_DONE:
+        return
+
+    if _find_browser_executable():
+        _PLAYWRIGHT_INSTALL_DONE = True
+        return
+
+    async with _PLAYWRIGHT_INSTALL_LOCK:
+        if _PLAYWRIGHT_INSTALL_DONE:
+            return
+
+        target_browser = str(browser or "chromium").strip().lower()
+        if target_browser not in {"chromium", "firefox", "webkit"}:
+            target_browser = "chromium"
+
+        rc, output = await _run_playwright_cli(
+            ["install", target_browser],
+            timeout_sec=_PLAYWRIGHT_INSTALL_TIMEOUT_SEC,
+        )
+        if rc != 0:
+            logger.warning(
+                "playwright install failed "
+                f"(code={rc}, browser={target_browser}): {output[-300:]}"
+            )
+            return
+
+        logger.info(f"playwright install success: {target_browser}")
+        _PLAYWRIGHT_INSTALL_DONE = True
+
+
+def start_playwright_runtime_prepare(*, browser: str = "chromium") -> None:
+    global _PLAYWRIGHT_PREPARE_TASK
+
+    if _PLAYWRIGHT_PREPARE_TASK is not None and not _PLAYWRIGHT_PREPARE_TASK.done():
+        return
+
+    if _find_browser_executable():
+        return
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+
+    async def _runner() -> None:
+        try:
+            await ensure_playwright_runtime_ready(browser=browser)
+        except Exception as exc:
+            logger.warning(f"playwright background prepare failed: {exc!s}")
+
+    _PLAYWRIGHT_PREPARE_TASK = loop.create_task(_runner())
+
+
+def _find_browser_executable() -> str | None:
+    custom = str(os.environ.get("STEAM_HTML_RENDER_BROWSER") or "").strip()
+    if custom and Path(custom).exists():
+        return custom
+
+    candidates = [
+        os.path.join(
+            os.environ.get("ProgramFiles", r"C:\Program Files"),
+            "Microsoft",
+            "Edge",
+            "Application",
+            "msedge.exe",
+        ),
+        os.path.join(
+            os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+            "Microsoft",
+            "Edge",
+            "Application",
+            "msedge.exe",
+        ),
+        os.path.join(
+            os.environ.get("ProgramFiles", r"C:\Program Files"),
+            "Google",
+            "Chrome",
+            "Application",
+            "chrome.exe",
+        ),
+        os.path.join(
+            os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+            "Google",
+            "Chrome",
+            "Application",
+            "chrome.exe",
+        ),
+        os.path.join(
+            os.environ.get("LocalAppData", ""),
+            "Microsoft",
+            "Edge",
+            "Application",
+            "msedge.exe",
+        ),
+        os.path.join(
+            os.environ.get("LocalAppData", ""),
+            "Google",
+            "Chrome",
+            "Application",
+            "chrome.exe",
+        ),
+    ]
+
+    for name in ("msedge", "msedge.exe", "chrome", "chrome.exe"):
+        found = shutil.which(name)
+        if found:
+            candidates.append(found)
+
+    seen: set[str] = set()
+    for item in candidates:
+        p = str(item or "").strip()
+        if not p or p in seen:
+            continue
+        seen.add(p)
+        if Path(p).exists():
+            return p
+    return None
+
+
+def _image_to_data_uri(image_obj, *, filename: str = "image.png") -> str | None:
+    if image_obj is None:
+        return None
+    if Image is None:
+        return None
+    if not hasattr(image_obj, "save"):
+        return None
+
+    try:
+        buf = io.BytesIO()
+        image_obj.save(buf, format="PNG")
+        payload = base64.b64encode(buf.getvalue()).decode("ascii")
+        mime, _ = mimetypes.guess_type(filename)
+        mime = mime or "image/png"
+        return f"data:{mime};base64,{payload}"
+    except Exception:
+        return None
+
+
+def _escape_text(value: object) -> str:
+    return html.escape(str(value or "").strip())
+
+
+def _multiline_to_html(value: object) -> str:
+    txt = _escape_text(value)
+    return txt.replace("\n", "<br>")
+
+
+def _state_label(state: str) -> str:
+    mapping = {
+        "in_game": "游戏中",
+        "online": "在线",
+        "offline": "离线",
+        "ended": "结束",
+    }
+    return mapping.get(state, state or "未知")
+
+
+def _state_color(state: str) -> str:
+    mapping = {
+        "in_game": "#34d399",
+        "online": "#60a5fa",
+        "offline": "#94a3b8",
+        "ended": "#f59e0b",
+    }
+    return mapping.get(state, "#a5b4fc")
+
+
+def _template_dir() -> Path:
+        return Path(__file__).resolve().parent / "assets" / "template"
+
+
+def _get_jinja_env() -> JinjaEnvironment:
+        global _JINJA_ENV
+
+        if _JINJA_ENV is not None:
+                return _JINJA_ENV
+
+        if Environment is None or FileSystemLoader is None or select_autoescape is None:
+                raise RuntimeError("jinja2 is not installed")
+
+        _JINJA_ENV = Environment(
+                loader=FileSystemLoader(str(_template_dir())),
+                autoescape=select_autoescape(enabled_extensions=("html", "xml"), default=True),
+        )
+        return _JINJA_ENV
+
+
+def _render_template(template_name: str, values: dict[str, object]) -> str:
+    env = _get_jinja_env()
+    return env.get_template(template_name).render(**values)
+
+
+def _build_batch_status_html(entries: list[dict]) -> str:
+    row_entries: list[dict[str, str]] = []
+    for entry in entries:
+        state = str(entry.get("new_state") or "")
+        cover_uri = _image_to_data_uri(entry.get("cover"), filename="cover.png")
+        avatar_uri = _image_to_data_uri(entry.get("avatar"), filename="avatar.png")
+
+        steam_name = str(entry.get("steam_name") or "").strip()
+        group_nickname = str(entry.get("group_nickname") or "").strip()
+        if not steam_name and not group_nickname:
+            combined_name = str(entry.get("display_name") or "").strip()
+            if combined_name:
+                if combined_name.endswith(")") and "(" in combined_name:
+                    split_index = combined_name.rfind("(")
+                    steam_name = combined_name[:split_index].strip()
+                    group_nickname = combined_name[split_index + 1 : -1].strip()
+                else:
+                    steam_name = combined_name
+
+        if not steam_name:
+            steam_name = group_nickname or "未知成员"
+        if not group_nickname:
+            group_nickname = "-"
+
+        row_entries.append(
+            {
+                "status": state,
+                "state_label": _state_label(state),
+                "cover_uri": str(cover_uri or ""),
+                "avatar_uri": str(avatar_uri or ""),
+                "steam_name": steam_name,
+                "group_nickname": group_nickname,
+                "status_desc": str(entry.get("status_desc") or "状态未知"),
+                "game_name": str(entry.get("game_name") or ""),
+                "playtime_text": str(entry.get("playtime_text") or ""),
+                "comment_text": str(entry.get("comment_text") or ""),
+            }
+        )
+
+    now_text = _escape_text(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()))
+    return _render_template(
+        "batch_status.html",
+        {
+            "total": len(entries),
+            "entries": row_entries,
+            "generated_at": now_text,
+        },
+    )
+
+
+def _build_news_html(
+    *,
+    appid: int,
+    game_name: str,
+    title: str,
+    author: str,
+    date_ts: int,
+    contents: str,
+    cover,
+) -> str:
+    cover_uri = _image_to_data_uri(cover, filename=f"{appid}.png")
+    date_text = (
+        time.strftime("%Y-%m-%d %H:%M", time.localtime(int(date_ts)))
+        if int(date_ts or 0) > 0
+        else "未知时间"
+    )
+
+    cover_html = (
+        f'<img src="{cover_uri}" alt="cover">'
+        if cover_uri
+        else '<div class="empty">No Cover</div>'
+    )
+    return _render_template(
+        "news.html",
+        {
+            "cover_html": Markup(cover_html),
+            "appid": _escape_text(appid),
+            "game_name": _escape_text(game_name or f"App {appid}"),
+            "title": _escape_text(title or "新公告"),
+            "author": _escape_text(author or "Steam"),
+            "date_text": _escape_text(date_text),
+            "contents_html": Markup(
+                _multiline_to_html(
+                contents or "请点击链接查看完整公告内容。"
+                )
+            ),
+            "generated_at": _escape_text(
+                time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+            ),
+        },
+    )
+
+
+async def _render_page_to_png(
+    *,
+    browser,
+    html_text: str,
+    width: int,
+    min_height: int,
+    out_path: Path,
+) -> str | None:
+    page = None
+    try:
+        timeout_ms = int(float(_HTML_RENDER_PAGE_TIMEOUT_SEC) * 1000)
+        page = await browser.new_page(
+            viewport={
+                "width": max(420, int(width)),
+                "height": max(320, int(min_height)),
+            },
+            device_scale_factor=1.5,
+        )
+        await page.set_content(html_text, wait_until="load", timeout=timeout_ms)
+        content_height = await page.evaluate(
+            """
+            () => {
+              const body = document.body;
+              const doc = document.documentElement;
+              return Math.ceil(Math.max(
+                body ? body.scrollHeight : 0,
+                body ? body.offsetHeight : 0,
+                doc ? doc.clientHeight : 0,
+                doc ? doc.scrollHeight : 0,
+                doc ? doc.offsetHeight : 0,
+              ));
+            }
+            """
+        )
+        await page.set_viewport_size(
+            {
+                "width": max(420, int(width)),
+                "height": max(320, int(content_height or min_height)),
+            }
+        )
+        await page.screenshot(
+            path=str(out_path),
+            full_page=True,
+            type="png",
+            timeout=timeout_ms,
+        )
+        return str(out_path)
+    except Exception as exc:
+        logger.warning(f"Browser render failed: {exc!s}")
+        return None
+    finally:
+        if page is not None:
+            try:
+                await page.close()
+            except Exception:
+                pass
+
+
+async def _render_html_to_png_file(
+    *,
+    html_text: str,
+    width: int,
+    prefix: str,
+    min_height: int,
+) -> str | None:
+    temp_dir = Path(get_astrbot_temp_path())
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    out_path = temp_dir / f"{prefix}_{uuid.uuid4().hex}.png"
+
+    runtime = await _PLAYWRIGHT_RUNTIME.get()
+    if runtime is None:
+        return None
+
+    executable_path = _find_browser_executable()
+    launch_args = [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-software-rasterizer",
+        "--no-zygote",
+        "--no-first-run",
+        "--no-default-browser-check",
+    ]
+
+    browser = None
+    try:
+        launch_timeout_ms = int(float(_HTML_RENDER_LAUNCH_TIMEOUT_SEC) * 1000)
+        kwargs: dict[str, Any] = {
+            "headless": True,
+            "args": launch_args,
+            "timeout": launch_timeout_ms,
+        }
+        if executable_path:
+            kwargs["executable_path"] = executable_path
+
+        browser = await runtime.chromium.launch(**kwargs)
+        return await _render_page_to_png(
+            browser=browser,
+            html_text=html_text,
+            width=width,
+            min_height=min_height,
+            out_path=out_path,
+        )
+    except Exception as exc:
+        logger.warning(f"Failed to render html snapshot by playwright: {exc!s}")
+        return None
+    finally:
+        if browser is not None:
+            try:
+                await browser.close()
+            except Exception:
+                pass
 
 
 class SteamRenderer:
     def __init__(self, cards_dir: Path):
         self._cards_dir = cards_dir
         self._plugin_src_dir = Path(__file__).resolve().parent
-        self._steam_logo_cache: dict[tuple[int, int], Any] = {}
-        self._font_cache: dict[tuple[str, int], Any] = {}
-        self._selected_font_path: str | None = None
-        self._logo_warned = False
-        self._font_warned = False
 
-    def _resolve_plugin_fonts_dir(self) -> Path | None:
-        candidates = [
-            self._plugin_src_dir / "fonts",
-            self._cards_dir.parent / "fonts",
-        ]
-        for p in candidates:
-            if p.exists() and p.is_dir():
-                return p
-        return None
-
-    def _resolve_logo_svg_path(self) -> Path | None:
-        candidates = [
-            self._plugin_src_dir / "assets" / "logo_steam.svg",
-            self._cards_dir.parent / "assets" / "logo_steam.svg",
-        ]
-        for p in candidates:
-            if p.exists() and p.is_file():
-                return p
-        return None
-
-    def _label(self, zh: str, en: str) -> str:
-        return zh if self._selected_font_path else en
+    def start_runtime_prepare(self) -> None:
+        start_playwright_runtime_prepare(browser="chromium")
 
     def runtime_diagnostics(self) -> dict[str, str]:
         plugin_dir = self._cards_dir.parent
         fonts_dir = plugin_dir / "fonts"
         logo_svg = plugin_dir / "assets" / "logo_steam.svg"
-
-        font_obj = self._load_font(20)
-        logo_obj = self._load_steam_logo_icon(134, 30)
+        browser_path = _find_browser_executable()
 
         return {
-            "pillow": "ok" if Image is not None and ImageFont is not None else "missing",
-            "cairosvg": "ok" if cairosvg is not None else "missing",
+            "pillow": "ok" if Image is not None else "missing",
+            "cairosvg": "ok",
             "fonts_dir": "exists" if fonts_dir.exists() else "missing",
             "logo_svg": "exists" if logo_svg.exists() else "missing",
-            "selected_font": self._selected_font_path or "none",
-            "font_runtime": "ok" if font_obj is not None else "failed",
-            "svg_runtime": "ok" if logo_obj is not None else "failed",
+            "selected_font": "browser",
+            "font_runtime": "ok",
+            "svg_runtime": "ok",
+            "playwright": "ok" if browser_path else "need_install",
+            "browser_path": browser_path or "none",
         }
 
-    async def render_playing_card(
-        self,
-        *,
-        steam_name: str,
-        group_name: str,
-        game_name: str,
-        playtime_text: str,
-        cover,
-        avatar,
-    ) -> str | None:
-        if Image is None or ImageDraw is None:
-            return None
-        return await asyncio.to_thread(
-            self._render_playing_card_sync,
-            steam_name,
-            group_name,
-            game_name,
-            playtime_text,
-            cover,
-            avatar,
-        )
-
     async def render_batch_status_card(self, entries: list[dict]) -> str | None:
-        if not entries or Image is None or ImageDraw is None:
+        if not entries:
             return None
-        return await asyncio.to_thread(self._render_batch_status_card_sync, entries)
+        html_text = _build_batch_status_html(entries)
+        return await _render_html_to_png_file(
+            html_text=html_text,
+            width=980,
+            prefix="steam_batch",
+            min_height=680,
+        )
 
     async def render_news_card(
         self,
@@ -113,624 +563,18 @@ class SteamRenderer:
         contents: str,
         cover,
     ) -> str | None:
-        if Image is None or ImageDraw is None:
-            return None
-        return await asyncio.to_thread(
-            self._render_news_card_sync,
-            appid,
-            game_name,
-            title,
-            author,
-            date_ts,
-            contents,
-            cover,
+        html_text = _build_news_html(
+            appid=appid,
+            game_name=game_name,
+            title=title,
+            author=author,
+            date_ts=date_ts,
+            contents=contents,
+            cover=cover,
         )
-
-    def _render_batch_status_card_sync(self, entries: list[dict]) -> str | None:
-        if not entries or Image is None or ImageDraw is None:
-            return None
-
-        count = len(entries)
-        width = 900
-        header_h = 112
-        row_h = 188
-        padding = 22
-        height = header_h + row_h * count + padding
-
-        canvas = Image.new("RGB", (width, height), color=(15, 23, 34))
-        draw = ImageDraw.Draw(canvas)
-
-        for y in range(height):
-            t = y / max(1, height - 1)
-            r = int(15 + 16 * t)
-            g = int(23 + 24 * t)
-            b = int(34 + 32 * t)
-            draw.line([(0, y), (width, y)], fill=(r, g, b))
-
-        font_title = self._load_font(32)
-        font_sub = self._load_font(20)
-        font_name = self._load_font(24)
-        font_text = self._load_font(20)
-        font_small = self._load_font(18)
-
-        draw.rounded_rectangle([(22, 18), (width - 22, 104)], radius=16, fill=(26, 38, 53))
-        draw.rounded_rectangle([(22, 18), (width - 22, 62)], radius=16, fill=(40, 57, 78))
-        title_text = self._label(f"Steam 状态变化汇总 · {count} 人", f"Steam Status Update · {count}")
-        title_font = self._fit_font_size(draw, title_text, 32, 18, width - 280, 30)
-        title_text = self._ellipsize_text(draw, title_text, title_font, width - 280)
-        draw.text(
-            (38, 28),
-            title_text,
-            fill=(236, 240, 245),
-            font=title_font,
+        return await _render_html_to_png_file(
+            html_text=html_text,
+            width=980,
+            prefix="steam_news",
+            min_height=560,
         )
-        subtitle_text = self._label("本轮检测到状态变化（开始/结束游戏/在线变化）", "Detected state changes in this poll")
-        subtitle_text = self._ellipsize_text(draw, subtitle_text, font_sub, width - 280)
-        draw.text(
-            (40, 70),
-            subtitle_text,
-            fill=(170, 196, 216),
-            font=font_sub,
-        )
-        self._draw_steam_badge(canvas, draw, width - 194, 30)
-
-        state_color = {
-            "in_game": (122, 235, 160),
-            "online": (100, 190, 255),
-            "offline": (170, 170, 170),
-            "ended": (255, 188, 120),
-        }
-
-        for idx, it in enumerate(entries):
-            top = header_h + idx * row_h
-            self._draw_shadow(canvas, (20, top + 8, width - 20, top + row_h - 10), radius=14)
-            draw.rounded_rectangle(
-                [(20, top + 8), (width - 20, top + row_h - 10)],
-                radius=14,
-                fill=(30, 43, 60),
-            )
-            draw.rounded_rectangle(
-                [(20, top + 8), (width - 20, top + row_h - 10)],
-                radius=14,
-                outline=(58, 76, 98),
-                width=2,
-            )
-
-            ns = str(it.get("new_state") or "")
-            bar_color = state_color.get(ns, (178, 210, 230))
-            draw.rounded_rectangle(
-                [(24, top + 14), (32, top + row_h - 16)],
-                radius=4,
-                fill=bar_color,
-            )
-
-            cover = it.get("cover")
-            if cover is None:
-                cover = Image.new("RGB", (102, 136), color=(55, 60, 68))
-            cover = self._rounded_image(cover, (102, 136), 10)
-            row_top = top + 8
-            row_bottom = top + row_h - 10
-            row_height = row_bottom - row_top
-            cover_y = row_top + max(0, (row_height - 136) // 2)
-            canvas.paste(cover, (42, cover_y), cover)
-
-            avatar = it.get("avatar")
-            if avatar is None:
-                avatar = Image.new("RGB", (64, 64), color=(85, 90, 100))
-            avatar = self._circle_image(avatar, 64)
-            avatar_x = 156
-            avatar_y = top + 20
-            canvas.paste(avatar, (avatar_x, avatar_y), avatar)
-
-            badge_text = self._label(self._state_text(ns), ns or "unknown")
-            badge_w = 72
-            badge_h = 22
-            badge_x1 = avatar_x - 4
-            badge_y1 = avatar_y + 72
-            badge_x2 = badge_x1 + badge_w
-            badge_y2 = badge_y1 + badge_h
-            draw.rounded_rectangle(
-                [(badge_x1, badge_y1), (badge_x2, badge_y2)],
-                radius=8,
-                fill=(45, 62, 84),
-            )
-            badge_font = self._load_font(15)
-            text_box = draw.textbbox((0, 0), badge_text, font=badge_font)
-            text_w = text_box[2] - text_box[0]
-            text_h = text_box[3] - text_box[1]
-            draw.text(
-                (badge_x1 + (badge_w - text_w) // 2, badge_y1 + (badge_h - text_h) // 2 - 1),
-                badge_text,
-                fill=bar_color,
-                font=badge_font,
-            )
-
-            raw_name = str(it.get("display_name") or "未知")
-            name = self._shorten_display_name(raw_name, group_max_chars=10)
-            status_desc = str(it.get("status_desc") or "")
-            game_name = str(it.get("game_name") or "")
-            playtime = str(it.get("playtime_text") or "")
-            comment_text = str(it.get("comment_text") or "")
-
-            status_symbol = self._status_symbol(ns)
-            name_line = self._ellipsize_text(draw, f"{status_symbol} {name}", font_name, width - 410)
-            draw.text((236, top + 22), name_line, fill=(245, 245, 245), font=font_name)
-            draw.text((236, top + 62), status_desc, fill=(169, 223, 255), font=font_text)
-
-            tag_w = 120
-            draw.rounded_rectangle(
-                [(width - tag_w - 34, top + 22), (width - 28, top + 56)],
-                radius=10,
-                fill=(45, 62, 84),
-            )
-            draw.text(
-                (width - tag_w - 18, top + 28),
-                self._label(self._state_text(ns), ns or "unknown"),
-                fill=bar_color,
-                font=font_small,
-            )
-
-            if game_name:
-                draw.text(
-                    (236, top + 98),
-                    self._label(f"游戏：{game_name}", f"Game: {game_name}"),
-                    fill=(220, 220, 220),
-                    font=font_small,
-                )
-            if playtime:
-                draw.text((236, top + 126), playtime, fill=(200, 200, 200), font=font_small)
-            if comment_text:
-                draw.text(
-                    (236, top + 148),
-                    self._label(
-                        f"评价：{self._truncate_text(draw, comment_text, font_small, width - 290)}",
-                        f"Comment: {self._truncate_text(draw, comment_text, font_small, width - 290)}",
-                    ),
-                    fill=(158, 204, 236),
-                    font=font_small,
-                )
-
-        draw.text(
-            (width - 250, height - 22),
-            self._label(
-                time.strftime("生成于 %Y-%m-%d %H:%M:%S", time.localtime()),
-                time.strftime("Generated at %Y-%m-%d %H:%M:%S", time.localtime()),
-            ),
-            fill=(130, 150, 168),
-            font=self._load_font(14),
-        )
-
-        out = self._cards_dir / f"steam_batch_{int(time.time())}_{uuid.uuid4().hex[:8]}.png"
-        out.parent.mkdir(parents=True, exist_ok=True)
-        canvas.save(out, format="PNG")
-        return str(out)
-
-    def _render_news_card_sync(
-        self,
-        appid: int,
-        game_name: str,
-        title: str,
-        author: str,
-        date_ts: int,
-        contents: str,
-        cover,
-    ) -> str | None:
-        if Image is None or ImageDraw is None:
-            return None
-
-        width = 900
-        height = 500
-        canvas = Image.new("RGB", (width, height), color=(17, 24, 33))
-        draw = ImageDraw.Draw(canvas)
-
-        for y in range(height):
-            t = y / max(1, height - 1)
-            draw.line(
-                [(0, y), (width, y)],
-                fill=(int(17 + 10 * t), int(24 + 14 * t), int(33 + 18 * t)),
-            )
-
-        if cover is None:
-            cover = Image.new("RGB", (270, 460), color=(43, 53, 66))
-        cover = self._rounded_image(cover, (270, 460), 14)
-        canvas.paste(cover, (20, 20), cover)
-
-        draw.rounded_rectangle([(310, 20), (width - 20, height - 20)], radius=16, fill=(30, 43, 60))
-
-        font_brand = self._load_font(22)
-        font_game = self._load_font(32)
-        font_title = self._load_font(28)
-        font_meta = self._load_font(20)
-        font_body = self._load_font(20)
-
-        draw.text((334, 38), "STEAM NEWS", fill=(122, 204, 255), font=font_brand)
-        draw.text((334, 72), game_name or f"App {appid}", fill=(238, 242, 248), font=font_game)
-        self._draw_steam_badge(canvas, draw, width - 194, 30)
-
-        title_lines = self._wrap_text(draw, title or "新公告", font_title, width - 354)
-        y = 124
-        for ln in title_lines[:2]:
-            draw.text((334, y), ln, fill=(240, 240, 240), font=font_title)
-            y += 36
-
-        meta_time = time.strftime("%Y-%m-%d %H:%M", time.localtime(date_ts)) if date_ts > 0 else self._label("未知时间", "unknown")
-        draw.text(
-            (334, 206),
-            self._label(f"作者：{author or 'Steam'}", f"Author: {author or 'Steam'}"),
-            fill=(170, 196, 216),
-            font=font_meta,
-        )
-        draw.text(
-            (334, 232),
-            self._label(f"时间：{meta_time}", f"Time: {meta_time}"),
-            fill=(170, 196, 216),
-            font=font_meta,
-        )
-
-        body = (contents or "").replace("\r", "").replace("\n\n", "\n").replace("\n", " ").strip()
-        if len(body) > 210:
-            body = body[:210].rstrip() + "..."
-        body_lines = self._wrap_text(
-            draw,
-            body or self._label("请点击链接查看完整公告内容。", "Please open the link for full details."),
-            font_body,
-            width - 354,
-        )
-
-        by = 280
-        for ln in body_lines[:6]:
-            draw.text((334, by), ln, fill=(220, 225, 232), font=font_body)
-            by += 28
-
-        draw.text(
-            (width - 210, height - 34),
-            self._label("来自 Steam News", "From Steam News"),
-            fill=(130, 150, 168),
-            font=self._load_font(16),
-        )
-
-        out = self._cards_dir / f"steam_news_{int(time.time())}_{uuid.uuid4().hex[:8]}.png"
-        out.parent.mkdir(parents=True, exist_ok=True)
-        canvas.save(out, format="PNG")
-        return str(out)
-
-    def _render_playing_card_sync(
-        self,
-        steam_name: str,
-        group_name: str,
-        game_name: str,
-        playtime_text: str,
-        cover,
-        avatar,
-    ) -> str | None:
-        if Image is None or ImageDraw is None:
-            return None
-
-        if cover is None:
-            cover = Image.new("RGB", (420, 520), color=(40, 40, 40))
-        if avatar is None:
-            avatar = Image.new("RGB", (128, 128), color=(70, 70, 70))
-
-        canvas = Image.new("RGB", (760, 360), color=(23, 26, 33))
-        draw = ImageDraw.Draw(canvas)
-
-        left = cover.resize((250, 360))
-        canvas.paste(left, (0, 0))
-
-        right_x = 272
-        display = self._shorten_display_name(f"{steam_name}({group_name})", group_max_chars=10)
-
-        font_title = self._load_font(34)
-        font_text = self._load_font(24)
-        font_small = self._load_font(20)
-
-        title_font = self._fit_font_size(draw, display, 34, 20, 458, 44)
-        display = self._ellipsize_text(draw, display, title_font, 458)
-        game_name = self._ellipsize_text(draw, game_name, font_text, 458)
-        draw.text((right_x, 36), display, fill=(240, 240, 240), font=title_font)
-        draw.text((right_x, 92), game_name, fill=(173, 216, 230), font=font_text)
-        draw.text((right_x, 136), playtime_text, fill=(200, 200, 200), font=font_small)
-
-        avatar = self._circle_image(avatar, 96)
-        canvas.paste(avatar, (right_x, 206), avatar)
-        self._draw_steam_badge(canvas, draw, 560, 24)
-        draw.text(
-            (right_x + 114, 236),
-            self._label("状态：游戏中", "Status: in game"),
-            fill=(122, 255, 160),
-            font=font_text,
-        )
-
-        out = self._cards_dir / f"steam_{int(time.time())}_{uuid.uuid4().hex[:8]}.png"
-        out.parent.mkdir(parents=True, exist_ok=True)
-        canvas.save(out, format="PNG")
-        return str(out)
-
-    def _load_font(self, size: int):
-        if ImageFont is None:
-            return None
-        plugin_fonts = self._resolve_plugin_fonts_dir()
-        if not self._selected_font_path:
-            candidates: list[str] = []
-            preferred = [
-                (plugin_fonts / "NotoSansHans-Medium.otf") if plugin_fonts else None,
-                (plugin_fonts / "NotoSansHans-Regular.otf") if plugin_fonts else None,
-            ]
-            for fp in preferred:
-                if fp and fp.exists():
-                    candidates.append(str(fp))
-
-            if plugin_fonts and plugin_fonts.exists():
-                for ext in ("*.otf", "*.ttf", "*.ttc"):
-                    for fp in sorted(plugin_fonts.glob(ext)):
-                        p = str(fp)
-                        if p not in candidates:
-                            candidates.append(p)
-
-            candidates.extend(
-                [
-                    "C:/Windows/Fonts/msyh.ttc",
-                    "C:/Windows/Fonts/simhei.ttf",
-                    "C:/Windows/Fonts/msyhbd.ttc",
-                ]
-            )
-            for p in candidates:
-                try:
-                    ImageFont.truetype(p, size=16, encoding="unic")
-                    self._selected_font_path = p
-                    logger.info(f"[steam-watch] selected font: {p}")
-                    break
-                except Exception:
-                    try:
-                        data = Path(p).read_bytes()
-                        ImageFont.truetype(io.BytesIO(data), size=16, encoding="unic")
-                        self._selected_font_path = p
-                        logger.info(f"[steam-watch] selected font(by bytes): {p}")
-                        break
-                    except Exception:
-                        continue
-
-        candidates = [self._selected_font_path] if self._selected_font_path else []
-
-        for p in candidates:
-            if not p:
-                continue
-            key = (p, size)
-            if key in self._font_cache:
-                return self._font_cache[key]
-            try:
-                font = ImageFont.truetype(p, size=size, encoding="unic")
-                self._font_cache[key] = font
-                return font
-            except Exception:
-                try:
-                    data = Path(p).read_bytes()
-                    font = ImageFont.truetype(io.BytesIO(data), size=size, encoding="unic")
-                    self._font_cache[key] = font
-                    return font
-                except Exception:
-                    continue
-
-        if not self._font_warned:
-            logger.warning("[steam-watch] no usable truetype font found, fallback to Pillow default font (may cause garbled text)")
-            self._font_warned = True
-        return ImageFont.load_default()
-
-    @staticmethod
-    def _state_text(state: str) -> str:
-        if state == "in_game":
-            return "游戏中"
-        if state == "ended":
-            return "游戏结束"
-        if state == "online":
-            return "在线"
-        if state == "offline":
-            return "离线"
-        return state or "未知"
-
-    @staticmethod
-    def _status_symbol(state: str) -> str:
-        if state == "in_game":
-            return ">"
-        if state == "ended":
-            return "!"
-        if state == "online":
-            return "*"
-        if state == "offline":
-            return "-"
-        return "."
-
-    def _draw_steam_badge(self, canvas, draw, x: int, y: int) -> None:
-        draw.rounded_rectangle([(x, y), (x + 160, y + 48)], radius=10, fill=(34, 51, 74))
-        logo = self._load_steam_logo_icon(134, 30)
-        if logo is not None:
-            lx = x + (160 - logo.width) // 2
-            ly = y + (48 - logo.height) // 2
-            canvas.paste(logo, (lx, ly), logo)
-        else:
-            draw.text((x + 40, y + 13), "STEAM", fill=(215, 230, 245), font=self._load_font(20))
-            if not self._logo_warned:
-                logger.warning("[steam-watch] steam logo svg render failed; use text fallback")
-                self._logo_warned = True
-
-    def _load_steam_logo_icon(self, target_w: int, target_h: int):
-        if Image is None:
-            return None
-        cache_key = (target_w, target_h)
-        if cache_key in self._steam_logo_cache:
-            return self._steam_logo_cache[cache_key]
-
-        logo_svg = self._cards_dir.parent / "assets" / "logo_steam.svg"
-        resolved_logo = self._resolve_logo_svg_path()
-        if not resolved_logo or cairosvg is None:
-            if not self._logo_warned:
-                if not resolved_logo:
-                    logger.warning("[steam-watch] assets/logo_steam.svg not found")
-                if cairosvg is None:
-                    logger.warning("[steam-watch] CairoSVG unavailable, cannot render svg logo")
-                self._logo_warned = True
-            return None
-
-        try:
-            svg_data = resolved_logo.read_bytes()
-            ratio = 355.666 / 89.333
-            vb = self._parse_svg_viewbox(svg_data)
-            if vb is not None and vb[2] > 0 and vb[3] > 0:
-                ratio = vb[2] / vb[3]
-
-            output_w = max(1, int(target_w))
-            output_h = max(1, int(round(output_w / ratio)))
-            if output_h > target_h:
-                output_h = int(target_h)
-                output_w = max(1, int(round(output_h * ratio)))
-
-            png_bytes = cairosvg.svg2png(
-                bytestring=svg_data,
-                output_width=output_w,
-                output_height=output_h,
-            )
-            logo = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
-            self._steam_logo_cache[cache_key] = logo
-            return logo
-        except Exception:
-            return None
-
-    @staticmethod
-    def _parse_svg_viewbox(svg_data: bytes) -> tuple[float, float, float, float] | None:
-        try:
-            text = svg_data.decode("utf-8", errors="ignore")
-            m = re.search(r'viewBox\s*=\s*"([^\"]+)"', text)
-            if not m:
-                return None
-            parts = [p for p in re.split(r"[\s,]+", m.group(1).strip()) if p]
-            if len(parts) != 4:
-                return None
-            return tuple(float(x) for x in parts)  # type: ignore[return-value]
-        except Exception:
-            return None
-
-    @staticmethod
-    def _rounded_image(img, size: tuple[int, int], radius: int):
-        if Image is None or ImageDraw is None:
-            return img
-        src = img.convert("RGBA").resize(size)
-        mask = Image.new("L", size, 0)
-        d = ImageDraw.Draw(mask)
-        d.rounded_rectangle([(0, 0), (size[0] - 1, size[1] - 1)], radius=radius, fill=255)
-        src.putalpha(mask)
-        return src
-
-    @staticmethod
-    def _circle_image(img, size: int):
-        if Image is None or ImageDraw is None:
-            return img
-        src = img.convert("RGBA").resize((size, size))
-        mask = Image.new("L", (size, size), 0)
-        d = ImageDraw.Draw(mask)
-        d.ellipse([(0, 0), (size - 1, size - 1)], fill=255)
-        src.putalpha(mask)
-        return src
-
-    @staticmethod
-    def _draw_shadow(canvas, box: tuple[int, int, int, int], radius: int = 14):
-        if Image is None or ImageDraw is None or ImageFilter is None:
-            return
-        x1, y1, x2, y2 = box
-        w = max(1, x2 - x1)
-        h = max(1, y2 - y1)
-        shadow = Image.new("RGBA", (w + 16, h + 16), (0, 0, 0, 0))
-        d = ImageDraw.Draw(shadow)
-        d.rounded_rectangle([(8, 8), (w + 2, h + 2)], radius=radius, fill=(0, 0, 0, 110))
-        shadow = shadow.filter(ImageFilter.GaussianBlur(5))
-        canvas.paste(shadow, (x1 - 8, y1 - 8), shadow)
-
-    @staticmethod
-    def _truncate_text(draw, text: str, font, max_width: int) -> str:
-        if not text:
-            return ""
-        if max_width <= 0:
-            return text
-        curr = text.strip()
-        while curr:
-            box = draw.textbbox((0, 0), curr, font=font)
-            if box[2] - box[0] <= max_width:
-                return curr
-            curr = curr[:-1]
-        return ""
-
-    @staticmethod
-    def _ellipsize_text(draw, text: str, font, max_width: int) -> str:
-        if not text:
-            return ""
-        text = text.strip()
-        box = draw.textbbox((0, 0), text, font=font)
-        if box[2] - box[0] <= max_width:
-            return text
-        ellipsis = "..."
-        current = text
-        while current:
-            candidate = current + ellipsis
-            box = draw.textbbox((0, 0), candidate, font=font)
-            if box[2] - box[0] <= max_width:
-                return candidate
-            current = current[:-1]
-        return ellipsis
-
-    @staticmethod
-    def _shorten_display_name(display_name: str, group_max_chars: int = 10) -> str:
-        text = (display_name or "").strip()
-        if not text:
-            return text
-        left = text.rfind("(")
-        right = text.rfind(")")
-        if left >= 0 and right > left:
-            steam_name = text[:left]
-            group_name = text[left + 1 : right]
-            if len(group_name) > group_max_chars:
-                group_name = group_name[:group_max_chars] + "..."
-            return f"{steam_name}({group_name})"
-        return text
-
-    def _fit_font_size(
-        self,
-        draw,
-        text: str,
-        start_size: int,
-        min_size: int,
-        max_width: int,
-        max_height: int,
-    ):
-        size = max(min_size, start_size)
-        while size >= min_size:
-            font = self._load_font(size)
-            box = draw.textbbox((0, 0), text, font=font)
-            width = box[2] - box[0]
-            height = box[3] - box[1]
-            if width <= max_width and height <= max_height:
-                return font
-            size -= 1
-        return self._load_font(min_size)
-
-    @staticmethod
-    def _wrap_text(draw, text: str, font, max_width: int) -> list[str]:
-        if not text:
-            return []
-        words = text.split(" ")
-        lines: list[str] = []
-        current = ""
-        for w in words:
-            nxt = w if not current else f"{current} {w}"
-            box = draw.textbbox((0, 0), nxt, font=font)
-            width = box[2] - box[0]
-            if width <= max_width:
-                current = nxt
-                continue
-            if current:
-                lines.append(current)
-                current = w
-            else:
-                lines.append(w)
-                current = ""
-        if current:
-            lines.append(current)
-        return lines

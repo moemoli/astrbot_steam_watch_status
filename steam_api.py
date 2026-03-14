@@ -31,7 +31,9 @@ class SteamApi:
         if not text:
             return None
 
-        m = re.search(r"steamcommunity\.com/profiles/(\d{17})(?:/|$)", text, re.IGNORECASE)
+        m = re.search(
+            r"steamcommunity\.com/profiles/(\d{17})(?:/|$)", text, re.IGNORECASE
+        )
         if m:
             return m.group(1)
 
@@ -39,7 +41,9 @@ class SteamApi:
         if m:
             return await self._resolve_vanity(m.group(1))
 
-        m = re.search(r"steamcommunity\.com/addfriend/(\d+)(?:/|$)", text, re.IGNORECASE)
+        m = re.search(
+            r"steamcommunity\.com/addfriend/(\d+)(?:/|$)", text, re.IGNORECASE
+        )
         if m:
             acc = int(m.group(1))
             return str(STEAM_ID64_BASE + acc)
@@ -101,7 +105,9 @@ class SteamApi:
     async def _resolve_steamid_from_any_url(self, url: str) -> str | None:
         if not url:
             return None
-        m = re.search(r"steamcommunity\.com/profiles/(\d{17})(?:/|$)", url, re.IGNORECASE)
+        m = re.search(
+            r"steamcommunity\.com/profiles/(\d{17})(?:/|$)", url, re.IGNORECASE
+        )
         if m:
             return m.group(1)
 
@@ -175,7 +181,7 @@ class SteamApi:
                     if resp.status != 200:
                         continue
                     data = await resp.json(content_type=None)
-                players = (((data or {}).get("response") or {}).get("players") or [])
+                players = ((data or {}).get("response") or {}).get("players") or []
                 for p in players:
                     sid = str((p or {}).get("steamid") or "").strip()
                     if sid:
@@ -209,7 +215,7 @@ class SteamApi:
     async def fetch_playtime_text(self, steamid64: str, appid: int) -> str:
         http = self._http()
         if not steamid64 or appid <= 0 or not self.steam_web_api_key or not http:
-            return "游戏时长：未知"
+            return "未知"
         try:
             api = "https://api.steampowered.com/IPlayerService/GetOwnedGames/v1/"
             params = {
@@ -220,17 +226,19 @@ class SteamApi:
             }
             async with http.get(api, params=params) as resp:
                 if resp.status != 200:
-                    return "游戏时长：未知"
+                    return "未知"
                 data = await resp.json(content_type=None)
-            games = (((data or {}).get("response") or {}).get("games") or [])
+            games = ((data or {}).get("response") or {}).get("games") or []
             for g in games:
                 if int((g or {}).get("appid") or 0) == int(appid):
                     mins = int((g or {}).get("playtime_forever") or 0)
-                    hours = mins / 60
-                    return f"游戏时长：{hours:.1f} 小时"
-            return "游戏时长：未知"
+                    total_seconds = mins * 60
+                    hours, rem = divmod(total_seconds, 3600)
+                    minutes, seconds = divmod(rem, 60)
+                    return f"{hours}时{minutes}分{seconds}秒"
+            return "未知"
         except Exception:
-            return "游戏时长：未知"
+            return "未知"
 
     async def resolve_app(self, raw: str) -> dict | None:
         http = self._http()
@@ -309,6 +317,49 @@ class SteamApi:
         except Exception:
             return ""
 
+    async def fetch_app_brief(self, appid: int) -> dict | None:
+        http = self._http()
+        if appid <= 0 or not http:
+            return None
+        try:
+            api = "https://store.steampowered.com/api/appdetails"
+            params = {
+                "appids": str(appid),
+                "l": "schinese",
+                "cc": "cn",
+            }
+            async with http.get(api, params=params) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json(content_type=None)
+
+            obj = (data or {}).get(str(appid)) or {}
+            if not obj.get("success"):
+                return None
+
+            inner = obj.get("data") or {}
+            name = str(inner.get("name") or "").strip() or f"App {appid}"
+            short_description = str(inner.get("short_description") or "").strip()
+            developers = inner.get("developers") or []
+            publishers = inner.get("publishers") or []
+            release = inner.get("release_date") or {}
+            release_date = str(release.get("date") or "").strip()
+
+            dev_text = "、".join(str(x).strip() for x in developers if str(x).strip())
+            pub_text = "、".join(str(x).strip() for x in publishers if str(x).strip())
+
+            return {
+                "appid": appid,
+                "name": name,
+                "short_description": short_description,
+                "developers": dev_text,
+                "publishers": pub_text,
+                "release_date": release_date,
+                "url": f"https://store.steampowered.com/app/{appid}/",
+            }
+        except Exception:
+            return None
+
     async def fetch_latest_news_gid(self, appid: int) -> str:
         latest = await self.fetch_latest_news(appid)
         if not latest:
@@ -331,7 +382,7 @@ class SteamApi:
                 if resp.status != 200:
                     return None
                 data = await resp.json(content_type=None)
-            newsitems = (((data or {}).get("appnews") or {}).get("newsitems") or [])
+            newsitems = ((data or {}).get("appnews") or {}).get("newsitems") or []
             if not newsitems:
                 return None
             return newsitems[0]
@@ -421,7 +472,9 @@ class SteamApi:
                     if img is not None:
                         return img
             except Exception as exc:
-                logger.debug(f"steamgriddb grid fetch failed (grid_id={grid_id}): {exc!s}")
+                logger.debug(
+                    f"steamgriddb grid fetch failed (grid_id={grid_id}): {exc!s}"
+                )
 
         return None
 

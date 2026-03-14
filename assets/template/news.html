@@ -1,0 +1,112 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <!--
+    模板：news.html
+    作用：
+      渲染单条 Steam 新闻/商店预览卡片。
+
+    可用变量：
+      - cover_html: Markup，预生成的封面 <img> 或兜底块。
+      - appid: str/int，Steam 游戏 ID。
+      - game_name: str，展示游戏名。
+      - title: str，新闻标题。
+      - author: str，作者/来源。
+      - date_text: str，格式化后的发布时间。
+      - contents_html: Markup，正文富文本（换行已处理）。
+      - generated_at: str，渲染时间戳。
+
+    安全改造说明：
+      1) 除非同步修改 Python 侧，否则不要改变量占位符名称。
+      2) CSS 的颜色/间距/尺寸可自由调整。
+      3) 建议保留主结构（.card/.header/.body-wrap/.news）以保证稳定。
+  -->
+  <style>
+    /* 基础主题 */
+    :root {
+      color-scheme: dark;
+      font-family: "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: linear-gradient(180deg, #0f172a 0%, #111827 100%);
+      color: #e5e7eb;
+      padding: 24px;
+    }
+    .card {
+      width: 100%;
+      max-width: 960px;
+      margin: 0 auto;
+      background: rgba(15, 23, 42, 0.86);
+      border: 1px solid rgba(148, 163, 184, 0.24);
+      border-radius: 16px;
+      overflow: hidden;
+      box-shadow: 0 16px 40px rgba(0, 0, 0, 0.35);
+    }
+    .header {
+      padding: 20px 24px 16px;
+      border-bottom: 1px solid rgba(148, 163, 184, 0.22);
+      background: linear-gradient(135deg, rgba(30,41,59,0.95), rgba(15,23,42,0.95));
+    }
+    .title {
+      font-size: 28px;
+      line-height: 1.3;
+      font-weight: 700;
+      color: #f8fafc;
+      margin: 0 0 6px;
+      word-break: break-word;
+    }
+    .subtitle {
+      margin: 0;
+      color: #94a3b8;
+      font-size: 16px;
+      line-height: 1.5;
+    }
+    .footer {
+      padding: 12px 24px 18px;
+      color: #64748b;
+      font-size: 12px;
+      text-align: right;
+      border-top: 1px solid rgba(148, 163, 184, 0.18);
+    }
+    /* 双栏内容布局 */
+    .body-wrap { padding: 18px; display:grid; grid-template-columns: 280px 1fr; gap: 18px; }
+    .cover-box { width: 280px; height: 460px; border-radius: 12px; overflow: hidden; border: 1px solid rgba(148,163,184,0.25); background: #334155; }
+    .cover-box img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .empty { width:100%; height:100%; display:flex; align-items:center; justify-content:center; color:#94a3b8; }
+    .news { background: rgba(30,41,59,0.78); border:1px solid rgba(148,163,184,0.2); border-radius: 12px; padding: 18px 20px; }
+    .meta { color:#93c5fd; font-size:14px; margin-bottom:8px; }
+    .game { color:#f8fafc; font-size:30px; font-weight:700; margin-bottom:10px; word-break: break-word; }
+    .news-title { color:#f1f5f9; font-size:24px; font-weight:700; line-height:1.4; margin-bottom:12px; word-break: break-word; }
+    .info { color:#94a3b8; font-size:14px; margin-bottom:14px; }
+    .desc { color:#cbd5e1; font-size:16px; line-height:1.7; word-break: break-word; }
+  </style>
+</head>
+<body>
+  <!-- 卡片容器 -->
+  <div class="card">
+    <!-- 头部区域 -->
+    <div class="header">
+      <p class="title">STEAM NEWS</p>
+      <p class="subtitle">游戏资讯卡片</p>
+    </div>
+
+    <!-- 主体内容：左侧封面 + 右侧文章信息 -->
+    <div class="body-wrap">
+      <div class="cover-box">{{ cover_html }}</div>
+      <div class="news">
+        <div class="meta">AppID: {{ appid }}</div>
+        <div class="game">{{ game_name }}</div>
+        <div class="news-title">{{ title }}</div>
+        <div class="info">作者：{{ author }}　|　时间：{{ date_text }}</div>
+        <div class="desc">{{ contents_html }}</div>
+      </div>
+    </div>
+
+    <!-- 底部时间戳 -->
+    <div class="footer">Generated at {{ generated_at }}</div>
+  </div>
+</body>
+</html>
