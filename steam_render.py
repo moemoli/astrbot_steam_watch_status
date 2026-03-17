@@ -306,6 +306,52 @@ def _find_browser_executable() -> str | None:
     return None
 
 
+def _cleanup_stale_render_files(
+    temp_dir: Path,
+    *,
+    prefix: str,
+    max_age_sec: int = 6 * 3600,
+    max_keep: int = 200,
+) -> None:
+    pattern = f"{str(prefix or '').strip()}_*.png"
+    if not str(prefix or "").strip():
+        return
+
+    now_ts = time.time()
+    remaining: list[tuple[float, Path]] = []
+
+    try:
+        files = list(temp_dir.glob(pattern))
+    except Exception:
+        return
+
+    for file in files:
+        try:
+            stat = file.stat()
+            mtime = float(stat.st_mtime)
+        except Exception:
+            continue
+
+        if (now_ts - mtime) > float(max_age_sec):
+            try:
+                file.unlink(missing_ok=True)
+            except Exception:
+                pass
+            continue
+
+        remaining.append((mtime, file))
+
+    if len(remaining) <= int(max_keep):
+        return
+
+    remaining.sort(key=lambda item: item[0], reverse=True)
+    for _, file in remaining[int(max_keep) :]:
+        try:
+            file.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 def _image_to_data_uri(image_obj, *, filename: str = "image.png") -> str | None:
     if image_obj is None:
         return None
@@ -715,6 +761,7 @@ async def _render_html_to_png_file(
 
     temp_dir = Path(get_astrbot_temp_path())
     temp_dir.mkdir(parents=True, exist_ok=True)
+    _cleanup_stale_render_files(temp_dir, prefix=prefix)
     out_path = temp_dir / f"{prefix}_{uuid.uuid4().hex}.png"
 
     if is_playwright_runtime_preparing():

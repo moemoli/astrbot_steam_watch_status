@@ -101,7 +101,8 @@ class SteamApi:
                 return from_final
 
             return await self._extract_steamid_from_text(page_text)
-        except Exception:
+        except Exception as exc:
+            logger.warning(f"resolve short link failed: {exc!s}")
             return None
 
     async def _resolve_s_team_link(self, url: str) -> str | None:
@@ -171,7 +172,8 @@ class SteamApi:
                 if sid:
                     return sid
             return None
-        except Exception:
+        except Exception as exc:
+            logger.warning(f"resolve vanity failed: {exc!s}")
             return None
 
     async def fetch_player_summary(self, steamid64: str) -> dict | None:
@@ -201,7 +203,10 @@ class SteamApi:
                     sid = str((p or {}).get("steamid") or "").strip()
                     if sid:
                         out[sid] = p
-            except Exception:
+            except Exception as exc:
+                logger.warning(
+                    f"fetch player summaries failed for batch(size={len(batch)}): {exc!s}"
+                )
                 continue
         return out
 
@@ -252,7 +257,10 @@ class SteamApi:
                     minutes, seconds = divmod(rem, 60)
                     return f"{hours}时{minutes}分{seconds}秒"
             return "未知"
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                f"fetch playtime failed (steamid64={steamid64}, appid={appid}): {exc!s}"
+            )
             return "未知"
 
     async def resolve_app(self, raw: str) -> dict | None:
@@ -306,7 +314,8 @@ class SteamApi:
                 "name": name,
                 "url": f"https://store.steampowered.com/app/{appid}/",
             }
-        except Exception:
+        except Exception as exc:
+            logger.warning(f"resolve app failed: {exc!s}")
             return None
 
     async def fetch_app_name(self, appid: int) -> str:
@@ -329,7 +338,8 @@ class SteamApi:
                 return ""
             inner = obj.get("data") or {}
             return str(inner.get("name") or "")
-        except Exception:
+        except Exception as exc:
+            logger.warning(f"fetch app name failed (appid={appid}): {exc!s}")
             return ""
 
     async def fetch_app_brief(self, appid: int) -> dict | None:
@@ -397,7 +407,8 @@ class SteamApi:
                 "is_free": is_free,
                 "url": f"https://store.steampowered.com/app/{appid}/",
             }
-        except Exception:
+        except Exception as exc:
+            logger.warning(f"fetch app brief failed (appid={appid}): {exc!s}")
             return None
 
     async def itad_lookup_game(self, *, appid: int = 0, title: str = "") -> dict | None:
@@ -433,7 +444,8 @@ class SteamApi:
                 return None
             game = data.get("game")
             return dict(game) if isinstance(game, dict) else None
-        except Exception:
+        except Exception as exc:
+            logger.warning(f"itad lookup exception: {exc!s}")
             return None
 
     async def itad_search_game(self, title: str, *, limit: int = 10) -> list[dict]:
@@ -462,7 +474,8 @@ class SteamApi:
             if not isinstance(data, list):
                 return []
             return [dict(x) for x in data if isinstance(x, dict)]
-        except Exception:
+        except Exception as exc:
+            logger.warning(f"itad search exception: {exc!s}")
             return []
 
     async def itad_fetch_year_history(
@@ -553,7 +566,8 @@ class SteamApi:
                 "currency": currency,
                 "points": points,
             }
-        except Exception:
+        except Exception as exc:
+            logger.warning(f"itad year history exception: {exc!s}")
             return None
 
     def _itad_auth_params(self) -> dict[str, str]:
@@ -591,7 +605,8 @@ class SteamApi:
             if not newsitems:
                 return None
             return newsitems[0]
-        except Exception:
+        except Exception as exc:
+            logger.warning(f"fetch latest news failed (appid={appid}): {exc!s}")
             return None
 
     async def fetch_cover_image(self, appid: int):
@@ -613,7 +628,7 @@ class SteamApi:
                             if url:
                                 urls.append(url)
             except Exception as exc:
-                logger.debug(f"steamgriddb cover fetch failed: {exc!s}")
+                logger.warning(f"steamgriddb cover fetch failed: {exc!s}")
 
         urls.extend(
             [
@@ -677,7 +692,7 @@ class SteamApi:
                     if img is not None:
                         return img
             except Exception as exc:
-                logger.debug(
+                logger.warning(
                     f"steamgriddb grid fetch failed (grid_id={grid_id}): {exc!s}"
                 )
 
@@ -693,7 +708,8 @@ class SteamApi:
                     return None
                 data = await resp.read()
             return await asyncio.to_thread(self._decode_image_sync, data)
-        except Exception:
+        except Exception as exc:
+            logger.warning(f"fetch image failed: {exc!s}")
             return None
 
     @staticmethod

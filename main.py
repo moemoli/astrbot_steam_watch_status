@@ -11,11 +11,8 @@ import aiohttp
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.provider import Provider
-from astrbot.api.star import Context, Star, register
-from astrbot.core.utils.astrbot_path import (
-    get_astrbot_plugin_data_path,
-    get_astrbot_temp_path,
-)
+from astrbot.api.star import Context, Star, StarTools
+from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
 
 from .steam_api import SteamApi
 from .steam_render import SteamRenderer
@@ -40,58 +37,45 @@ class SteamWatch(Star):
 
     def __init__(self, context: Context, config=None):
         super().__init__(context, config)
-        self.config = config or {}
-        self.steam_web_api_key = str(
-            (self.config or {}).get("steam_web_api_key", "")
-        ).strip()
-        self.steamgriddb_api_key = str(
-            (self.config or {}).get("steamgriddb_api_key", "")
-        ).strip()
+        config = config or {}
+        self.config = config
+        self.steam_web_api_key = str(config.get("steam_web_api_key", "")).strip()
+        self.steamgriddb_api_key = str(config.get("steamgriddb_api_key", "")).strip()
         self.isthereanydeal_api_key = str(
-            (self.config or {}).get("isthereanydeal_api_key", "")
+            config.get("isthereanydeal_api_key", "")
         ).strip()
-        self.http_proxy = str((self.config or {}).get("http_proxy", "")).strip()
-        self.llm_provider_id = str(
-            (self.config or {}).get("llm_provider_id", "")
-        ).strip()
-        self.llm_comment_prompt = str(
-            (self.config or {}).get("llm_comment_prompt", "")
-        ).strip()
+        self.http_proxy = str(config.get("http_proxy", "")).strip()
+        self.llm_provider_id = str(config.get("llm_provider_id", "")).strip()
+        self.llm_comment_prompt = str(config.get("llm_comment_prompt", "")).strip()
         self._llm_comment_timeout_sec = self._parse_int_in_range(
-            (self.config or {}).get(
-                "llm_comment_timeout_sec", self._llm_comment_timeout_sec
-            ),
+            config.get("llm_comment_timeout_sec", self._llm_comment_timeout_sec),
             default=self._llm_comment_timeout_sec,
             min_value=3,
             max_value=60,
         )
         self._llm_comment_max_attempts = self._parse_int_in_range(
-            (self.config or {}).get(
-                "llm_comment_max_attempts", self._llm_comment_max_attempts
-            ),
+            config.get("llm_comment_max_attempts", self._llm_comment_max_attempts),
             default=self._llm_comment_max_attempts,
             min_value=1,
             max_value=5,
         )
         self._llm_comment_concurrency = self._parse_int_in_range(
-            (self.config or {}).get(
-                "llm_comment_concurrency", self._llm_comment_concurrency
-            ),
+            config.get("llm_comment_concurrency", self._llm_comment_concurrency),
             default=self._llm_comment_concurrency,
             min_value=1,
             max_value=5,
         )
-        self.verbose_poll_log = self._parse_bool(
-            (self.config or {}).get("verbose_poll_log", False)
-        )
+        self.verbose_poll_log = self._parse_bool(config.get("verbose_poll_log", False))
         self.poll_interval_sec = self._parse_poll_interval_sec(
-            (self.config or {}).get("poll_interval_sec", "60")
+            config.get("poll_interval_sec", "60")
         )
         temp_cards_dir = (
-            Path(get_astrbot_temp_path()) / "astrbot_plugin_steam_watch_status" / "cards"
+            Path(get_astrbot_temp_path())
+            / "astrbot_plugin_steam_watch_status"
+            / "cards"
         )
         self._store = SteamStateStore(
-            Path(get_astrbot_plugin_data_path()) / "astrbot_plugin_steam_watch_status",
+            StarTools.get_data_dir(),
             cards_dir=temp_cards_dir,
         )
         self._api = SteamApi(
@@ -382,8 +366,9 @@ class SteamWatch(Star):
         )
 
         if card:
-            await self.context.send_message(
-                event.unified_msg_origin, MessageChain().file_image(card)
+            await self._send_message_with_optional_image(
+                event.unified_msg_origin,
+                image_path=card,
             )
 
     @classmethod
@@ -688,10 +673,11 @@ class SteamWatch(Star):
         text = f"[Steam订阅测试] {game_name}\n{title}"
         if url:
             text += f"\n{url}"
-        chain = MessageChain().message(text)
-        if card:
-            chain.file_image(card)
-        await self.context.send_message(event.unified_msg_origin, chain)
+        await self._send_message_with_optional_image(
+            event.unified_msg_origin,
+            text=text,
+            image_path=card,
+        )
 
         return f"测试完成：已拉取并推送 {game_name} 的最新新闻。"
 
@@ -745,8 +731,9 @@ class SteamWatch(Star):
         if not card:
             return "价格图生成失败，请稍后重试。"
 
-        await self.context.send_message(
-            event.unified_msg_origin, MessageChain().file_image(card)
+        await self._send_message_with_optional_image(
+            event.unified_msg_origin,
+            image_path=card,
         )
         return ""
 
@@ -826,8 +813,9 @@ class SteamWatch(Star):
         if not card:
             return "状态图生成失败，请稍后重试。"
 
-        await self.context.send_message(
-            event.unified_msg_origin, MessageChain().file_image(card)
+        await self._send_message_with_optional_image(
+            event.unified_msg_origin,
+            image_path=card,
         )
         return "已发送你的 Steam 状态图。"
 
@@ -912,8 +900,9 @@ class SteamWatch(Star):
         if not card:
             return "状态图生成失败，请稍后重试。"
 
-        await self.context.send_message(
-            event.unified_msg_origin, MessageChain().file_image(card)
+        await self._send_message_with_optional_image(
+            event.unified_msg_origin,
+            image_path=card,
         )
         return "已发送当前群 Steam 绑定状态图。"
 
@@ -1328,7 +1317,7 @@ class SteamWatch(Star):
         card = await self._render_batch_status_card(enriched)
         if not card:
             return
-        await self.context.send_message(session, MessageChain().file_image(card))
+        await self._send_message_with_optional_image(session, image_path=card)
 
     async def _build_change_entry(self, change: dict, *, session: str) -> dict:
         steam_name = str(change.get("steam_name") or "未知")
@@ -1527,10 +1516,11 @@ class SteamWatch(Star):
                 text = f"[Steam更新] {game_name}\n{title}"
                 if url:
                     text += f"\n{url}"
-                chain = MessageChain().message(text)
-                if card:
-                    chain.file_image(card)
-                await self.context.send_message(str(s.get("session") or ""), chain)
+                await self._send_message_with_optional_image(
+                    str(s.get("session") or ""),
+                    text=text,
+                    image_path=card,
+                )
                 pushed_news += 1
 
             if app_brief:
@@ -1574,9 +1564,9 @@ class SteamWatch(Star):
                         price_text=price_text,
                     )
                     if sale_card:
-                        await self.context.send_message(
+                        await self._send_message_with_optional_image(
                             str(s.get("session") or ""),
-                            MessageChain().file_image(sale_card),
+                            image_path=sale_card,
                         )
                         pushed_news += 1
 
@@ -1707,6 +1697,38 @@ class SteamWatch(Star):
             currency=currency,
             points=points,
         )
+
+    @staticmethod
+    def _cleanup_sent_image(image_path: str) -> None:
+        path = str(image_path or "").strip()
+        if not path:
+            return
+        try:
+            Path(path).unlink(missing_ok=True)
+        except Exception as exc:
+            logger.debug(f"cleanup rendered card failed: {exc!s}")
+
+    async def _send_message_with_optional_image(
+        self,
+        session: str,
+        *,
+        text: str = "",
+        image_path: str | None = None,
+    ) -> None:
+        chain = MessageChain()
+        msg = str(text or "").strip()
+        if msg:
+            chain.message(msg)
+
+        image = str(image_path or "").strip()
+        if image:
+            chain.file_image(image)
+
+        try:
+            await self.context.send_message(session, chain)
+        finally:
+            if image:
+                self._cleanup_sent_image(image)
 
     async def _fetch_cover_image(self, appid: int):
         return await self._api.fetch_cover_image(appid)
