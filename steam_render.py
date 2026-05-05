@@ -402,8 +402,13 @@ class SteamRenderer:
         if not entries or not self._html_render_func:
             return None
         html_text = _build_batch_status_html(entries)
+        options = {
+            "full_page": True,
+            "type": "png",
+            "scale": "device",
+        }
         try:
-            return await self._html_render_func(html_text)
+            return await self._html_render_func(html_text, options)
         except Exception as exc:
             logger.warning(f"Failed to render batch status card: {exc!s}")
             return None
@@ -432,8 +437,13 @@ class SteamRenderer:
             price_text=price_text,
             cover=cover,
         )
+        options = {
+            "full_page": True,
+            "type": "png",
+            "scale": "device",
+        }
         try:
-            return await self._html_render_func(html_text)
+            return await self._html_render_func(html_text, options)
         except Exception as exc:
             logger.warning(f"Failed to render news card: {exc!s}")
             return None
@@ -456,8 +466,13 @@ class SteamRenderer:
             currency=currency,
             points=points,
         )
+        options = {
+            "full_page": True,
+            "type": "png",
+            "scale": "device",
+        }
         try:
-            return await self._html_render_func(html_text)
+            return await self._html_render_func(html_text, options)
         except Exception as exc:
             logger.warning(f"Failed to render itad price history card: {exc!s}")
             return None

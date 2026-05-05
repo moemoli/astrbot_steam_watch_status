@@ -88,10 +88,13 @@ class SteamWatch(Star):
             http_proxy=self.http_proxy,
         )
 
-        async def _html_render_wrapper(html_text: str) -> str | None:
+        async def _html_render_wrapper(
+            html_text: str, options: dict | None = None
+        ) -> str | None:
             """Wrapper to convert HTML string to image URL using AstrBot's html_render"""
             try:
-                return await self.html_render(html_text, {})
+                render_options = options or {}
+                return await self.html_render(html_text, {}, options=render_options)
             except Exception as exc:
                 logger.warning(f"Failed to render HTML: {exc}")
                 return None
