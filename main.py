@@ -1758,7 +1758,7 @@ class SteamWatch(Star):
             # Check if it's a URL or a local file path
             if image.startswith(("http://", "https://")):
                 # It's a URL, use image() method
-                chain.image(image)
+                chain.url_image(image)
             else:
                 # It's a local file path, use file_image() method
                 chain.file_image(image)
