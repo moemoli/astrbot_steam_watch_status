@@ -87,7 +87,18 @@ class SteamWatch(Star):
             self.isthereanydeal_api_key,
             http_proxy=self.http_proxy,
         )
-        self._renderer = SteamRenderer(self._store.cards_dir())
+
+        async def _html_render_wrapper(html_text: str) -> str | None:
+            """Wrapper to convert HTML string to image URL using AstrBot's html_render"""
+            try:
+                return await self.html_render(html_text, {})
+            except Exception as exc:
+                logger.warning(f"Failed to render HTML: {exc}")
+                return None
+
+        self._renderer = SteamRenderer(
+            self._store.cards_dir(), html_render_func=_html_render_wrapper
+        )
 
         self._lock = asyncio.Lock()
         self._llm_comment_lock = asyncio.Semaphore(self._llm_comment_concurrency)
@@ -124,7 +135,6 @@ class SteamWatch(Star):
             trust_env=False,
         )
         self._api.http = self._http
-        self._renderer.start_runtime_prepare()
         self._stop = False
         self._poll_task = asyncio.create_task(self._poll_loop())
         SteamWatch._global_poll_task = self._poll_task
@@ -307,6 +317,7 @@ class SteamWatch(Star):
     @steam.command("状态测试", alias={"status", "statustest"})
     async def status_test(self, event: AstrMessageEvent, target: str | None = None):
         await self._handle_status_test(event, str(target or "").strip())
+        event.stop_event()
 
     @steam.command("订阅", alias={"subscribe", "sub"})
     async def subscribe(self, event: AstrMessageEvent, game: str | None = None):
@@ -317,21 +328,24 @@ class SteamWatch(Star):
     @steam.command("订阅测试", alias={"subtest", "testsub"})
     async def subscribe_test(self, event: AstrMessageEvent, game: str | None = None):
         await self._handle_subscribe_test(event, str(game or "").strip())
+        event.stop_event()
 
     @steam.command("价格", alias={"price", "price1y"})
     async def price_query(self, event: AstrMessageEvent, game: str | None = None):
         msg = await self._handle_price_query(event, str(game or "").strip())
         if msg:
             yield event.plain_result(msg)
-            event.stop_event()
+        event.stop_event()
 
     @steam.command("列表", alias={"list", "ls"})
     async def list_status(self, event: AstrMessageEvent):
         await self._handle_list_status(event)
+        event.stop_event()
 
     @steam.command("我", alias={"me", "my"})
     async def me_status(self, event: AstrMessageEvent):
         await self._handle_me_status(event)
+        event.stop_event()
 
     @steam.command("自检", alias={"check", "diag"})
     @filter.permission_type(filter.PermissionType.ADMIN)

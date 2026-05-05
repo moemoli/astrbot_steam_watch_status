@@ -1,16 +1,10 @@
 from __future__ import annotations
 
-import asyncio
 import base64
 import html
 import io
 import mimetypes
-import os
-import platform
-import shutil
-import sys
 import time
-import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -18,7 +12,6 @@ from typing import TYPE_CHECKING, Any
 from markupsafe import Markup
 
 from astrbot.api import logger
-from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
 
 if TYPE_CHECKING:
     from jinja2 import Environment as JinjaEnvironment
@@ -38,318 +31,7 @@ except Exception:  # pragma: no cover
     select_autoescape = None
 
 
-def _env_int(name: str, default: int) -> int:
-    raw = str(os.environ.get(name) or "").strip()
-    if not raw:
-        return int(default)
-    try:
-        return int(raw)
-    except Exception:
-        return int(default)
-
-
-_HTML_RENDER_LAUNCH_TIMEOUT_SEC = max(
-    2, _env_int("STEAM_HTML_RENDER_LAUNCH_TIMEOUT", 8)
-)
-_HTML_RENDER_PAGE_TIMEOUT_SEC = max(2, _env_int("STEAM_HTML_RENDER_PAGE_TIMEOUT", 8))
-_PLAYWRIGHT_INSTALL_TIMEOUT_SEC = max(
-    60, _env_int("STEAM_PLAYWRIGHT_INSTALL_TIMEOUT", 600)
-)
-_PLAYWRIGHT_INSTALL_DEPS_TIMEOUT_SEC = max(
-    60, _env_int("STEAM_PLAYWRIGHT_INSTALL_DEPS_TIMEOUT", 600)
-)
-
-_PLAYWRIGHT_INSTALL_LOCK = asyncio.Lock()
-_PLAYWRIGHT_INSTALL_DONE = False
-_PLAYWRIGHT_PREPARE_TASK: asyncio.Task[Any] | None = None
-_PLAYWRIGHT_PREPARING_SKIP_LOGGED = False
 _JINJA_ENV: JinjaEnvironment | None = None
-
-
-class _PlaywrightRuntime:
-    def __init__(self) -> None:
-        self._playwright = None
-        self._lock = asyncio.Lock()
-
-    async def get(self):
-        async with self._lock:
-            if self._playwright is not None:
-                return self._playwright
-            try:
-                from playwright.async_api import async_playwright
-            except Exception as exc:
-                logger.warning(f"playwright import failed: {exc!s}")
-                return None
-
-            try:
-                self._playwright = await async_playwright().start()
-                return self._playwright
-            except Exception as exc:
-                logger.warning(f"playwright startup failed: {exc!s}")
-                return None
-
-
-_PLAYWRIGHT_RUNTIME = _PlaywrightRuntime()
-
-
-async def _run_playwright_cli(
-    args: list[str], *, timeout_sec: int, env: dict[str, str] | None = None
-) -> tuple[int, str]:
-    cmd = [sys.executable, "-m", "playwright", *args]
-    proc_env = os.environ.copy()
-    if env:
-        proc_env.update(env)
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            env=proc_env,
-        )
-    except Exception as exc:
-        return 1, f"spawn failed: {exc!s}"
-
-    try:
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=float(timeout_sec))
-    except TimeoutError:
-        try:
-            proc.kill()
-        except Exception:
-            pass
-        return 124, "timeout"
-    except Exception as exc:
-        return 1, f"run failed: {exc!s}"
-
-    text = (out or b"").decode("utf-8", errors="ignore").strip()
-    return int(proc.returncode or 0), text
-
-
-async def ensure_playwright_runtime_ready(*, browser: str = "chromium") -> None:
-    global _PLAYWRIGHT_INSTALL_DONE
-
-    if _PLAYWRIGHT_INSTALL_DONE:
-        return
-
-    if _find_browser_executable():
-        _PLAYWRIGHT_INSTALL_DONE = True
-        return
-
-    async with _PLAYWRIGHT_INSTALL_LOCK:
-        if _PLAYWRIGHT_INSTALL_DONE:
-            return
-
-        target_browser = str(browser or "chromium").strip().lower()
-        if target_browser not in {"chromium", "firefox", "webkit"}:
-            target_browser = "chromium"
-
-        rc_deps, output_deps = await _run_playwright_cli(
-            ["install-deps", target_browser],
-            timeout_sec=_PLAYWRIGHT_INSTALL_DEPS_TIMEOUT_SEC,
-        )
-        if rc_deps != 0:
-            logger.warning(
-                "playwright install-deps failed/skipped "
-                f"(code={rc_deps}, browser={target_browser}): {output_deps[-300:]}"
-            )
-        else:
-            logger.info(f"playwright install-deps success: {target_browser}")
-
-        install_attempts: list[dict[str, str] | None] = [None]
-        if platform.system().lower() == "linux" and not os.environ.get(
-            "PLAYWRIGHT_DOWNLOAD_HOST"
-        ):
-            install_attempts.insert(
-                0,
-                {
-                    "PLAYWRIGHT_DOWNLOAD_HOST": "https://cdn.npmmirror.com/binaries/playwright",
-                    "PLAYWRIGHT_CHROMIUM_DOWNLOAD_HOST": "https://cdn.npmmirror.com/binaries/chrome-for-testing",
-                },
-            )
-            install_attempts.insert(
-                1,
-                {
-                    "PLAYWRIGHT_DOWNLOAD_HOST": "https://npmmirror.com/mirrors/playwright",
-                    "PLAYWRIGHT_CHROMIUM_DOWNLOAD_HOST": "https://cdn.npmmirror.com/binaries/chrome-for-testing",
-                },
-            )
-
-        rc = 1
-        output = ""
-        for idx, install_env in enumerate(install_attempts, start=1):
-            if install_env:
-                logger.info(
-                    f"playwright install attempt#{idx} with mirror host: {install_env.get('PLAYWRIGHT_DOWNLOAD_HOST', '')}"
-                )
-            else:
-                logger.info(f"playwright install attempt#{idx} with default host")
-
-            rc, output = await _run_playwright_cli(
-                ["install", target_browser],
-                timeout_sec=_PLAYWRIGHT_INSTALL_TIMEOUT_SEC,
-                env=install_env,
-            )
-            if rc == 0:
-                break
-
-        if rc != 0:
-            logger.warning(
-                "playwright install failed "
-                f"(code={rc}, browser={target_browser}): {output[-300:]}"
-            )
-            return
-
-        logger.info(f"playwright install success: {target_browser}")
-        _PLAYWRIGHT_INSTALL_DONE = True
-
-
-def start_playwright_runtime_prepare(*, browser: str = "chromium") -> None:
-    global \
-        _PLAYWRIGHT_INSTALL_DONE, \
-        _PLAYWRIGHT_PREPARE_TASK, \
-        _PLAYWRIGHT_PREPARING_SKIP_LOGGED
-
-    if _PLAYWRIGHT_PREPARE_TASK is not None and not _PLAYWRIGHT_PREPARE_TASK.done():
-        return
-
-    local_browser = _find_browser_executable()
-    if local_browser:
-        _PLAYWRIGHT_INSTALL_DONE = True
-        logger.info(
-            f"local browser found on startup, skip playwright install: {local_browser}"
-        )
-        return
-
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        return
-
-    _PLAYWRIGHT_PREPARING_SKIP_LOGGED = False
-    logger.info("local browser missing on startup, preparing playwright in background")
-
-    async def _runner() -> None:
-        try:
-            await ensure_playwright_runtime_ready(browser=browser)
-        except Exception as exc:
-            logger.warning(f"playwright background prepare failed: {exc!s}")
-
-    _PLAYWRIGHT_PREPARE_TASK = loop.create_task(_runner())
-
-
-def is_playwright_runtime_preparing() -> bool:
-    return _PLAYWRIGHT_PREPARE_TASK is not None and not _PLAYWRIGHT_PREPARE_TASK.done()
-
-
-def _find_browser_executable() -> str | None:
-    custom = str(os.environ.get("STEAM_HTML_RENDER_BROWSER") or "").strip()
-    if custom and Path(custom).exists():
-        return custom
-
-    candidates = [
-        os.path.join(
-            os.environ.get("ProgramFiles", r"C:\Program Files"),
-            "Microsoft",
-            "Edge",
-            "Application",
-            "msedge.exe",
-        ),
-        os.path.join(
-            os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
-            "Microsoft",
-            "Edge",
-            "Application",
-            "msedge.exe",
-        ),
-        os.path.join(
-            os.environ.get("ProgramFiles", r"C:\Program Files"),
-            "Google",
-            "Chrome",
-            "Application",
-            "chrome.exe",
-        ),
-        os.path.join(
-            os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
-            "Google",
-            "Chrome",
-            "Application",
-            "chrome.exe",
-        ),
-        os.path.join(
-            os.environ.get("LocalAppData", ""),
-            "Microsoft",
-            "Edge",
-            "Application",
-            "msedge.exe",
-        ),
-        os.path.join(
-            os.environ.get("LocalAppData", ""),
-            "Google",
-            "Chrome",
-            "Application",
-            "chrome.exe",
-        ),
-    ]
-
-    for name in ("msedge", "msedge.exe", "chrome", "chrome.exe"):
-        found = shutil.which(name)
-        if found:
-            candidates.append(found)
-
-    seen: set[str] = set()
-    for item in candidates:
-        p = str(item or "").strip()
-        if not p or p in seen:
-            continue
-        seen.add(p)
-        if Path(p).exists():
-            return p
-    return None
-
-
-def _cleanup_stale_render_files(
-    temp_dir: Path,
-    *,
-    prefix: str,
-    max_age_sec: int = 6 * 3600,
-    max_keep: int = 200,
-) -> None:
-    pattern = f"{str(prefix or '').strip()}_*.png"
-    if not str(prefix or "").strip():
-        return
-
-    now_ts = time.time()
-    remaining: list[tuple[float, Path]] = []
-
-    try:
-        files = list(temp_dir.glob(pattern))
-    except Exception:
-        return
-
-    for file in files:
-        try:
-            stat = file.stat()
-            mtime = float(stat.st_mtime)
-        except Exception:
-            continue
-
-        if (now_ts - mtime) > float(max_age_sec):
-            try:
-                file.unlink(missing_ok=True)
-            except Exception:
-                pass
-            continue
-
-        remaining.append((mtime, file))
-
-    if len(remaining) <= int(max_keep):
-        return
-
-    remaining.sort(key=lambda item: item[0], reverse=True)
-    for _, file in remaining[int(max_keep) :]:
-        try:
-            file.unlink(missing_ok=True)
-        except Exception:
-            pass
 
 
 def _image_to_data_uri(image_obj, *, filename: str = "image.png") -> str | None:
@@ -692,168 +374,39 @@ def _build_itad_price_history_html(
     )
 
 
-async def _render_page_to_png(
-    *,
-    browser,
-    html_text: str,
-    width: int,
-    min_height: int,
-    out_path: Path,
-) -> str | None:
-    page = None
-    try:
-        timeout_ms = int(float(_HTML_RENDER_PAGE_TIMEOUT_SEC) * 1000)
-        page = await browser.new_page(
-            viewport={
-                "width": max(420, int(width)),
-                "height": max(320, int(min_height)),
-            },
-            device_scale_factor=1.5,
-        )
-        await page.set_content(html_text, wait_until="load", timeout=timeout_ms)
-        content_height = await page.evaluate(
-            """
-            () => {
-              const body = document.body;
-              const doc = document.documentElement;
-              return Math.ceil(Math.max(
-                body ? body.scrollHeight : 0,
-                body ? body.offsetHeight : 0,
-                doc ? doc.clientHeight : 0,
-                doc ? doc.scrollHeight : 0,
-                doc ? doc.offsetHeight : 0,
-              ));
-            }
-            """
-        )
-        await page.set_viewport_size(
-            {
-                "width": max(420, int(width)),
-                "height": max(320, int(content_height or min_height)),
-            }
-        )
-        await page.screenshot(
-            path=str(out_path),
-            full_page=True,
-            type="png",
-            timeout=timeout_ms,
-        )
-        return str(out_path)
-    except Exception as exc:
-        logger.warning(f"Browser render failed: {exc!s}")
-        return None
-    finally:
-        if page is not None:
-            try:
-                await page.close()
-            except Exception:
-                pass
-
-
-async def _render_html_to_png_file(
-    *,
-    html_text: str,
-    width: int,
-    prefix: str,
-    min_height: int,
-) -> str | None:
-    global _PLAYWRIGHT_PREPARING_SKIP_LOGGED
-
-    temp_dir = Path(get_astrbot_temp_path())
-    temp_dir.mkdir(parents=True, exist_ok=True)
-    _cleanup_stale_render_files(temp_dir, prefix=prefix)
-    out_path = temp_dir / f"{prefix}_{uuid.uuid4().hex}.png"
-
-    if is_playwright_runtime_preparing():
-        if not _PLAYWRIGHT_PREPARING_SKIP_LOGGED:
-            logger.info(
-                "playwright preparing in progress; skip browser render this round"
-            )
-            _PLAYWRIGHT_PREPARING_SKIP_LOGGED = True
-        return None
-
-    runtime = await _PLAYWRIGHT_RUNTIME.get()
-    if runtime is None:
-        return None
-
-    executable_path = _find_browser_executable()
-    launch_args = [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--disable-software-rasterizer",
-        "--no-zygote",
-        "--no-first-run",
-        "--no-default-browser-check",
-    ]
-
-    browser = None
-    try:
-        launch_timeout_ms = int(float(_HTML_RENDER_LAUNCH_TIMEOUT_SEC) * 1000)
-        kwargs: dict[str, Any] = {
-            "headless": True,
-            "args": launch_args,
-            "timeout": launch_timeout_ms,
-        }
-        if executable_path:
-            kwargs["executable_path"] = executable_path
-
-        browser = await runtime.chromium.launch(**kwargs)
-        return await _render_page_to_png(
-            browser=browser,
-            html_text=html_text,
-            width=width,
-            min_height=min_height,
-            out_path=out_path,
-        )
-    except Exception as exc:
-        logger.warning(f"Failed to render html snapshot by playwright: {exc!s}")
-        return None
-    finally:
-        if browser is not None:
-            try:
-                await browser.close()
-            except Exception:
-                pass
-
-
 class SteamRenderer:
-    def __init__(self, cards_dir: Path):
+    def __init__(self, cards_dir: Path, html_render_func=None):
         self._cards_dir = cards_dir
         self._plugin_src_dir = Path(__file__).resolve().parent
+        self._html_render_func = html_render_func
 
     def start_runtime_prepare(self) -> None:
-        start_playwright_runtime_prepare(browser="chromium")
+        pass
 
     def runtime_diagnostics(self) -> dict[str, str]:
         plugin_dir = self._cards_dir.parent
         fonts_dir = plugin_dir / "fonts"
         logo_svg = plugin_dir / "assets" / "logo_steam.svg"
-        browser_path = _find_browser_executable()
 
         return {
             "pillow": "ok" if Image is not None else "missing",
-            "cairosvg": "ok",
+            "html_render": "ok" if self._html_render_func else "not_set",
             "fonts_dir": "exists" if fonts_dir.exists() else "missing",
             "logo_svg": "exists" if logo_svg.exists() else "missing",
-            "selected_font": "browser",
+            "selected_font": "astrbot_builtin",
             "font_runtime": "ok",
             "svg_runtime": "ok",
-            "playwright": "ok" if browser_path else "need_install",
-            "browser_path": browser_path or "none",
         }
 
     async def render_batch_status_card(self, entries: list[dict]) -> str | None:
-        if not entries:
+        if not entries or not self._html_render_func:
             return None
         html_text = _build_batch_status_html(entries)
-        return await _render_html_to_png_file(
-            html_text=html_text,
-            width=980,
-            prefix="steam_batch",
-            min_height=320,
-        )
+        try:
+            return await self._html_render_func(html_text)
+        except Exception as exc:
+            logger.warning(f"Failed to render batch status card: {exc!s}")
+            return None
 
     async def render_news_card(
         self,
@@ -867,6 +420,8 @@ class SteamRenderer:
         price_text: str | None = None,
         cover,
     ) -> str | None:
+        if not self._html_render_func:
+            return None
         html_text = _build_news_html(
             appid=appid,
             game_name=game_name,
@@ -877,12 +432,11 @@ class SteamRenderer:
             price_text=price_text,
             cover=cover,
         )
-        return await _render_html_to_png_file(
-            html_text=html_text,
-            width=980,
-            prefix="steam_news",
-            min_height=560,
-        )
+        try:
+            return await self._html_render_func(html_text)
+        except Exception as exc:
+            logger.warning(f"Failed to render news card: {exc!s}")
+            return None
 
     async def render_itad_price_history_card(
         self,
@@ -893,6 +447,8 @@ class SteamRenderer:
         currency: str,
         points: list[dict],
     ) -> str | None:
+        if not self._html_render_func:
+            return None
         html_text = _build_itad_price_history_html(
             game_name=game_name,
             appid=appid,
@@ -900,9 +456,8 @@ class SteamRenderer:
             currency=currency,
             points=points,
         )
-        return await _render_html_to_png_file(
-            html_text=html_text,
-            width=1080,
-            prefix="steam_itad_price",
-            min_height=720,
-        )
+        try:
+            return await self._html_render_func(html_text)
+        except Exception as exc:
+            logger.warning(f"Failed to render itad price history card: {exc!s}")
+            return None

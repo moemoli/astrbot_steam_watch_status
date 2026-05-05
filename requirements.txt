@@ -1,5 +1,4 @@
 CairoSVG
 Pillow
 pillowmd
-playwright
 jinja2
