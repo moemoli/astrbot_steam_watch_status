@@ -403,15 +403,15 @@ class SteamRenderer:
             return None
         html_text = _build_batch_status_html(entries)
         # 裁剪到卡片主体区域，避免远程渲染默认画布过大导致上下左右留白。
-        clip_height = max(420, 240 + len(entries) * 220)
+        clip_height = max(400, 200 + len(entries) * 200)
         options = {
             "full_page": True,
             "type": "png",
             "scale": "device",
             "clip": {
-                "x": 24,
-                "y": 24,
-                "width": 960,
+                "x": 0,
+                "y": 0,
+                "width": 1004,
                 "height": clip_height,
             },
         }
