@@ -1755,12 +1755,19 @@ class SteamWatch(Star):
 
         image = str(image_path or "").strip()
         if image:
-            chain.file_image(image)
+            # Check if it's a URL or a local file path
+            if image.startswith(("http://", "https://")):
+                # It's a URL, use image() method
+                chain.image(image)
+            else:
+                # It's a local file path, use file_image() method
+                chain.file_image(image)
 
         try:
             await self.context.send_message(session, chain)
         finally:
-            if image:
+            # Only cleanup local files, not URLs
+            if image and not image.startswith(("http://", "https://")):
                 self._cleanup_sent_image(image)
 
     async def _fetch_cover_image(self, appid: int):
